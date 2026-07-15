@@ -1,0 +1,974 @@
+
+import array, time
+import neopixel
+import os
+import board
+import busio
+import micropython
+import microcontroller
+from pwmio import PWMOut
+import digitalio
+import pwmio
+from micropython import const
+from adafruit_bus_device.i2c_device import I2CDevice
+from adafruit_ht16k33 import matrix
+
+_shared_i2c = None
+
+def _get_shared_i2c():
+    global _shared_i2c
+    if _shared_i2c is None:
+        _shared_i2c = busio.I2C(board.GP21, board.GP20)
+    return _shared_i2c
+
+Dir_forward = 1
+Dir_backward = -1
+
+LF_forward = 1
+LF_backward = -1
+
+LB_forward = 1
+LB_backward = -1
+
+RF_forward = 1
+RF_backward = -1
+
+RB_forward = 1
+RB_backward = -1
+
+Adjustment = 1
+
+PWM_MAX = 65535
+
+'''
+Motor interface.
+    M1  _____  M2
+       |     |
+       |     |
+       |     |
+    M4 |_____| M3
+'''
+# left front wheel M1
+Motor_LF_PWM = PWMOut(board.GP12)
+Motor_LF_Dir = digitalio.DigitalInOut(board.GP13)
+Motor_LF_Dir.direction = digitalio.Direction.OUTPUT
+
+# right front wheel M2
+Motor_RF_PWM = PWMOut(board.GP15)
+Motor_RF_Dir = digitalio.DigitalInOut(board.GP14)
+Motor_RF_Dir.direction = digitalio.Direction.OUTPUT
+
+# right back wheel M3
+Motor_RB_PWM = PWMOut(board.GP19)
+Motor_RB_Dir = digitalio.DigitalInOut(board.GP18)
+Motor_RB_Dir.direction = digitalio.Direction.OUTPUT
+
+# left back wheel M4
+Motor_LB_PWM = PWMOut(board.GP16)
+Motor_LB_Dir = digitalio.DigitalInOut(board.GP17)
+Motor_LB_Dir.direction = digitalio.Direction.OUTPUT
+
+# mapping function
+def map(x,in_max, in_min, out_max, out_min):
+    return (x - in_min)/(in_max - in_min)*(out_max - out_min) + out_min
+
+class Buzzer():
+    def __init__(self):
+        self._buzzer = PWMOut(board.GP26, duty_cycle=0, frequency=440, variable_frequency=True)
+
+    def playtone(self, frequency):
+        self._buzzer.duty_cycle = 65535 // 2  # Half-full duty ratio
+        self._buzzer.frequency = frequency
+
+    def sound(self):
+        buzzer.playtone(1500)
+
+    def bequiet(self):
+        self._buzzer.duty_cycle = 0
+
+class Servo():
+    pwm_max = 2500
+    pwm_min = 500
+    period = 65535 # oxFFFF
+
+    def __init__(self):
+        self.servo = None
+        # store last commanded angle and pin for external introspection
+        self.pin = None
+        self.last_angle = None
+
+    def  set_angle(self, pin, angle):  # Pin:Servo GPIO pins, angle:Servo rotation angle -90~90.
+        if self.servo is not None:   # Resources are freed if the servo variable is not empty
+            self.servo.deinit()
+
+        self.servo = pwmio.PWMOut(pin,frequency=50,duty_cycle=0)
+        #self.servo.frequency = 50 # Set servo Freq.
+        if angle < -90:
+            angle = 90
+
+        if angle > 90:
+            angle = 90
+
+        high_level_time = map(angle, 90, -90, self.pwm_max, self.pwm_min)
+        # Servo duty cycle value.
+        duty_cycle_value = int((high_level_time/20000)*self.period)
+        self.servo.duty_cycle = duty_cycle_value
+
+        # record the pin and last angle so external code can read current position
+        try:
+            self.pin = pin
+            self.last_angle = int(angle)
+        except Exception:
+            self.last_angle = None
+
+        # Propagate to module-level servo singleton (if present) so other code
+        # reading car_module.servo.last_angle sees the change even if the call
+        # was made on a different Servo instance (e.g., created in the REPL).
+        try:
+            _mod_servo = globals().get('servo', None)
+            if _mod_servo is not None and _mod_servo is not self:
+                try:
+                    _mod_servo.last_angle = self.last_angle
+                    _mod_servo.pin = self.pin
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return self
+
+class Ultrasonic():
+    # Define output(trig) and input(echo) pins.
+    def __init__(self):
+        #Define output(trig) and input(echo) Pin.
+        self._trig = pwmio.PWMOut(board.GP3, frequency=1000, duty_cycle=0)
+        self._echo = digitalio.DigitalInOut(board.GP2)
+        self._echo.direction = digitalio.Direction.INPUT
+
+    def get_distance(self):
+        # Send a pulse to the trig Pin
+        self._trig.duty_cycle = 65535
+        time.sleep(1)
+        self._trig.duty_cycle = 0
+        # Wait for the echo pin to become high
+        while self._echo.value == False:
+            pass
+        # Record start time
+        start = time.monotonic_ns()
+        # Wait for the echo pin to lower
+        while self._echo.value == True:
+            pass
+        # End of record time
+        end = time.monotonic_ns()
+        # Calculate the duration of the pulse (nanosecond)
+        duration = end - start
+        # Distance (cm) calculated based on the speed of sound (343 m/s)
+        distance = ((duration / 2)/1000) * 0.0343
+        # Return distance value
+        return distance
+
+ultra = Ultrasonic()
+# Define a module-level servo instance and a recommended servo pin constant
+# so other code (REPL or main.py) can use the same Servo instance and read
+# the last commanded angle (_best-effort_).
+try:
+    SERVO_PIN = board.GP7
+except Exception:
+    SERVO_PIN = None
+
+# Create a module-level Servo instance for shared access
+try:
+    servo = Servo()
+except Exception:
+    servo = None
+
+class WS2812():
+    def __init__(self):
+        # Configure the number, pins, and brightness of WS2812/SK6812(color_led) leds.
+        self._led_num = 4 #  LED number
+        self._pin = board.GP11    # GPIO11
+        self.brightness_value = 0.2  # light brightness. The value range is 0~1.
+        # Create the StateMachine with the ws2812 program, outputting on Pin(PIN_NUM).
+        self.sm = neopixel.NeoPixel(self._pin, self._led_num)
+        # Display a pattern on the LEDs via an array of LED RGB values.
+        self.ar = array.array("I", [0 for _ in range(self._led_num)])
+
+    def pixels_show(self):
+        dimmer_ar = array.array("I", [0 for _ in range(self._led_num)])
+        for i,c in enumerate(self.ar):
+            r = int(((c >> 8) & 0xFF))
+            g = int(((c >> 16) & 0xFF))
+            b = int((c & 0xFF))
+            dimmer_ar[i] = (g<<16) + (r<<8) + b
+        self.sm[:] = dimmer_ar
+        time.sleep(0.01)
+
+    # Set multiple colors
+    # Set the color of the specified ws2812.
+    def pixels_set(self,i, color):
+        R = round(color[0] * self.brightness_value)
+        G = round(color[1] * self.brightness_value)
+        B = round(color[2] * self.brightness_value)
+        self.ar[i] = (G<<16) + (R<<8) + B
+        self.pixels_show()
+
+    # Set the color of all ws2812 led.
+    def pixels_fill(self,color):
+        for i in range(len(self.ar)):
+            self.pixels_set(i, color)
+
+    # Set a single color.
+    def set_color(self,i,R,G,B):
+
+        R = round(R * self.brightness_value)
+        G = round(G * self.brightness_value)
+        B = round(B * self.brightness_value)
+        self.ar[i] = (G<<16) + (R<<8) + B
+        self.pixels_show()
+
+    def set_color_all(self, R, G, B):
+        for i in range(len(self.ar)):
+            self.set_color(i, R, G, B)
+
+    # Adjust the brightness, the value range is 0-1, the default value is 0.2
+    def brightness(self, brightness = None):
+        if brightness == None:
+            return self.brightness_value
+        else:
+            if (brightness < 0):
+                brightness = 0
+        if (brightness > 1):
+            brightness = 1
+        self.brightness_value = brightness
+
+    # breathing light.
+    def breath(self, R, G, B):
+        breathSteps = 10
+        for i in range(1,breathSteps):
+            Breath_R = round(R*i/breathSteps)
+            Breath_G = round(G*i/breathSteps)
+            Breath_B = round(B*i/breathSteps)
+            self.set_color_all(Breath_R, Breath_G, Breath_B)
+
+            #self.pixels_show()
+            #self.setColor(self.colorBreathR*i/self.breathSteps, self.colorBreathG*i/self.breathSteps, self.colorBreathB*i/self.breathSteps)
+            time.sleep(0.06)
+        for i in range(1,breathSteps):
+            Breath_R = round(R-R*i/breathSteps)
+            Breath_G = round(G-G*i/breathSteps)
+            Breath_B = round(B-B*i/breathSteps)
+            self.set_color_all(Breath_R, Breath_G, Breath_B)
+            #self.pixels_show()
+
+            #self.setColor(self.colorBreathR-(self.colorBreathR*i/self.breathSteps), self.colorBreathG-(self.colorBreathG*i/self.breathSteps), self.colorBreathB-(self.colorBreathB*i/self.breathSteps))
+            time.sleep(0.06)
+
+    # Lights off
+    def stop(self):
+        self.set_color_all(0,0,0)
+
+    def test_multiple_colors(self):
+        BLACK = (0, 0, 0)
+        RED = (255, 0, 0)
+        YELLOW = (255, 150, 0)
+        GREEN = (0, 255, 0)
+        CYAN = (0, 255, 255)
+        BLUE = (0, 0, 255)
+        PURPLE = (180, 0, 255)
+        WHITE = (255, 255, 255)
+        COLORS = (BLACK, RED, YELLOW, GREEN, CYAN, BLUE, PURPLE, WHITE)
+        for color in COLORS:
+            self.pixels_fill(color)
+            #self.pixels_show()
+            time.sleep(2)
+
+class Motor():
+    def __init__(self):
+        pass
+
+    def _speed_to_duty(self, speed):
+        speed = max(0, min(100, speed))
+        return int(map(speed, 100, 0, PWM_MAX, 0))
+
+    def _drive_motor(self, pwm, direction_pin, status, direction, speed):
+        if status == 0:
+            direction_pin.value = False
+            pwm.duty_cycle = 0
+            return
+
+        value = self._speed_to_duty(speed)
+        if direction == Dir_forward:
+            direction_pin.value = False
+            pwm.duty_cycle = value
+        elif direction == Dir_backward:
+            direction_pin.value = True
+            pwm.duty_cycle = PWM_MAX - value
+
+    '''
+    (1, 1, 100) ---(status, direction, speed)
+     |  |   |
+     |  |   speed: value range 0~100.
+     |  direction: 1(forward), -1(backward)
+    status: 1(move), 0(stop)
+    '''
+    # Control the M1 motor (left front).
+    def motor_left_front(self, status, direction, speed):
+        '''
+        if status == 0: # stop.
+            Motor_LF_Dir.value = False
+            Motor_LF_PWM.duty_cycle = 0
+        else:
+            value = int(map(speed,100,0,65535,0))
+            if direction == Dir_forward: # 1, motor forward.
+                Motor_LF_Dir.value = False
+                Motor_LF_PWM.duty_cycle = value
+            elif direction == Dir_backward: # -1, motor backward.
+                otor_LF_Dir.value = True
+                Motor_LF_PWM.duty_cycle = 65535 - value
+        '''
+        self._drive_motor(Motor_LF_PWM, Motor_LF_Dir, status, direction, speed)
+
+    # Control the M2 motor (right front).
+    def motor_right_front(self, status, direction, speed):
+        '''
+        if status == 0: # stop.
+            Motor_RF_Dir.value = False
+            Motor_RF_PWM.duty_cycle = 0
+        else:
+            value = int(map(speed,0,100,0,65535))
+            Motor_RF_PWM.freq(500)
+            if direction == Dir_forward:
+                Motor_RF_Dir.value = False
+                Motor_RF_PWM.duty_cycle = value
+            elif direction == Dir_backward:
+                Motor_RF_Dir.value = True
+                Motor_RF_PWM.duty_cycle = 65535-value
+        '''
+        self._drive_motor(Motor_RF_PWM, Motor_RF_Dir, status, direction, speed)
+
+    # Control the M3 motor (right back).
+    def motor_right_back(self, status, direction, speed):
+        '''
+        if status == 0: # stop.
+            Motor_RB_Dir.value = False
+            Motor_RB_PWM.duty_cycle = 0
+        else:
+            value = int(map(speed,0,100,0,65535))
+            if direction == Dir_forward:
+                Motor_RB_Dir.value = True
+                Motor_RB_PWM.duty_cycle = 65535-value
+            elif direction == Dir_backward:
+                Motor_RB_Dir.value = False
+                Motor_RB_PWM.duty_cycle =value
+        '''
+        self._drive_motor(Motor_RB_PWM, Motor_RB_Dir, status, direction, speed)
+
+    # Control the M4 motor (left back).
+    def motor_left_back(self, status, direction, speed):
+        '''
+        if status == 0: # stop.
+            Motor_LB_Dir.value = False
+            Motor_LB_PWM.duty_cycle = 0
+        else:
+            value = int(map(speed,0,100,0,65535))
+            if direction == Dir_forward:
+                Motor_LB_Dir.value = True
+                Motor_LB_PWM.duty_cycle = 65535-value
+            elif direction == Dir_backward:
+                Motor_LB_Dir.value = False
+                Motor_LB_PWM.duty_cycle = value
+        '''
+        self._drive_motor(Motor_LB_PWM, Motor_LB_Dir, status, direction, speed)
+
+    def motor_stop(self):
+
+            Motor_LF_Dir.value = False
+            Motor_LF_PWM.duty_cycle = 0
+            Motor_LB_Dir.value = False
+            Motor_LB_PWM.duty_cycle = 0
+            Motor_RF_Dir.value = False
+            Motor_RF_PWM.duty_cycle = 0
+            Motor_RB_Dir.value = False
+            Motor_RB_PWM.duty_cycle = 0
+
+    def move(self, status, direction, speed):
+        if status == 0:
+            self.motor_stop()
+        else:
+            if direction == "forward":
+                print('forward')
+                # CALIBRACIÓN: Si se desvía a la izquierda, frena el lado derecho bajando factor_der
+                factor_izq = 1.0  
+                factor_der = 0.87
+                self.motor_left_front(1, LF_forward, speed*factor_izq)   # M1
+                self.motor_right_front(1, RF_forward, speed*factor_der)  # M2
+                self.motor_right_back(1, RB_forward, speed*factor_der)    # M3
+                self.motor_left_back(1, LB_forward, speed*factor_izq)     # M4
+
+            elif direction == "backward":
+                print('backward')
+                 # CALIBRACIÓN DISTANCIA: Aumenta este valor si se queda corto hacia atrás (ej. 1.10 = +10% de velocidad)
+                factor_distancia_atr = 1.2
+                
+                # CALIBRACIÓN RECTITUD: Aplicamos también corrección por si hacia atrás se desvía
+                factor_izq_atr = 1.0 * factor_distancia_atr
+                factor_der_atr = 0.78 * factor_distancia_atr # Mantenemos la corrección del lado derecho
+                self.motor_left_front(1, LF_backward, speed*factor_izq_atr)   # M1
+                self.motor_right_front(1, RF_backward, speed*factor_der_atr)  # M2
+                self.motor_right_back(1, RB_backward, speed*factor_der_atr)   # M3
+                self.motor_left_back(1, LB_backward, speed*factor_izq_atr)    # M4
+
+            elif direction == "left":
+                print('left')
+                side_comp=0.9
+                self.motor_left_front(1, LF_backward, speed)   # M1
+                self.motor_right_front(1, RF_forward, speed*side_comp)   # M2
+                self.motor_right_back(1, RB_backward, speed)    # M3
+                self.motor_left_back(1, LB_forward, speed*side_comp)    # M4
+            elif direction == "right":
+                print('right')
+                self.motor_left_front(1, LF_forward, speed)    # M1
+                self.motor_right_front(1, RF_backward, speed)  # M2
+                self.motor_right_back(1, RB_forward, speed)   # M3
+                self.motor_left_back(1, LB_backward, speed)     # M4
+
+            elif direction == "left_forward":
+                print('left_forward')
+                self.motor_left_front(0, LF_forward, speed)   # M1
+                self.motor_right_front(1, RF_forward, speed)       # M2
+                self.motor_right_back(0, RB_forward, speed)   # M3
+                self.motor_left_back(1, LB_forward, speed)        # M4
+
+            elif direction == "right_forward":
+                print('right_forward')
+                self.motor_left_front(1, LF_forward, speed)       # M1
+                self.motor_right_front(0, RF_forward, speed)  # M2
+                self.motor_right_back(1, RB_forward, speed)       # M3
+                self.motor_left_back(0, LB_forward, speed)     # M4
+
+            elif direction == "left_backward":
+                print('left_backward')
+                self.motor_left_front(1, LF_backward, speed)       # M1
+                self.motor_right_front(0, RF_backward, speed*0.5)  # M2
+                self.motor_right_back(1, RB_backward, speed)       # M3
+                self.motor_left_back(0, LB_backward, speed*0.5)    # M4
+
+            elif direction == "right_backward":
+                print('right_backward')
+                self.motor_left_front(0, LF_backward, speed*0.5)   # M1
+                self.motor_right_front(1, RF_backward, speed)      # M2
+                self.motor_right_back(0, RB_backward, speed*0.5)   # M3
+                self.motor_left_back(1, LB_backward, speed)        # M4
+
+            elif direction == "turn_left":
+                print('turn_left')
+                self.motor_left_front(1, LF_backward, speed)   # M1
+                self.motor_right_front(1, RF_forward, speed)   # M2
+                self.motor_right_back(1, RB_forward, speed)   # M3
+                self.motor_left_back(1, LB_backward, speed)     # M4
+
+            elif direction == "turn_right":
+                print('turn_right')
+                self.motor_left_front(1, LF_forward, speed)     # M1
+                self.motor_right_front(1, RF_backward, speed)   # M2
+                self.motor_right_back(1, RB_backward, speed)     # M3
+                self.motor_left_back(1, LB_forward, speed)     # M4
+            else:
+                print("Direction error!")
+
+class Line_tracking():
+    def __init__(self):
+        # Define three infrared ray tracking interface pins.
+        self.ir_left = digitalio.DigitalInOut(board.GP4)
+        self.ir_left.direction = digitalio.Direction.INPUT
+
+        self.ir_middle = digitalio.DigitalInOut(board.GP5)
+        self.ir_middle.direction = digitalio.Direction.INPUT
+
+        self.ir_right = digitalio.DigitalInOut(board.GP6)
+        self.ir_right.direction = digitalio.Direction.INPUT
+
+    def get_ir_value(self):
+        return [self.ir_left.value,self.ir_middle.value ,self.ir_right.value]
+
+'''
+no repetition：
+[9047, 4488, 554, 573, 558, 626, 556, 599, 558, 598, 558, 599, 557, 600, 532, 625, 532, 624, 558, 1672, 582, 1624, 554, 1698, 534, 1693, 533, 1697, 558, 1648, 555, 1696, 559, 1670, 557, 1671, 558, 598, 559, 1670, 558, 599, 582, 550, 582, 598, 559, 1671, 532, 623, 557, 600, 586, 1614, 562, 624, 557, 1645, 584, 1672, 558, 1671, 559, 573, 557, 1696, 557]
+repetitions
+[9072, 4492, 535, 601, 535, 600, 581, 571, 588, 596, 559, 572, 586, 596, 535, 622, 534, 597, 586, 1669, 581, 1669, 535, 1696, 585, 1644, 534, 1696, 559, 1670, 534, 1696, 558, 1673, 559, 1645, 610, 572, 560, 1670, 534, 629, 554, 570, 587, 573, 558, 1696, 559, 598, 533, 624, 558, 1671, 533, 623, 560, 1643, 588, 1642, 561, 1696, 533, 623, 560, 1671, 559, 39230, 9049, 2246, 583, 95490, 9027, 2265, 534, 95509, 9023, 2268, 559, 95482, 9014, 2269, 533, 95514, 9019, 2268, 585, 95443, 9041, 2268, 559, 95467, 9043, 2271, 531, 95495, 9043, 2247, 581, 95490, 9020, 2243, 559, 95517, 9043, 2246, 558, 95492, 9042, 2244, 559, 95492, 9017, 2268, 534,
+95490, 9046, 2269, 537, 95516, 9041, 2243, 535, 95517, 9089, 2152, 579, 95489, 9044, 2244, 585, 95492, 9025, 2269, 585]
+'''
+class IR(object):
+
+    CODE = {162: "1", 98: "2", 226: "3", 34: "4", 2: "5", 194: "6", 224: "7", 168: "8", 144: "9",
+            152: "0", 104: "*", 176: "#", 24: "up", 74: "down", 16: "left", 90: "right", 56: "ok"}
+
+    def __init__(self, gpioNum):
+        self.irRecv = digitalio.DigitalInOut(gpioNum)
+        self.irRecv.direction = digitalio.Direction.INPUT
+        self.irRecv.pull = digitalio.Pull.UP
+
+        self.ir_step = 0
+        self.ir_count = 0
+        self.buf64 = [0 for i in range(64)]
+        self.recived_ok = False
+        self.cmd = None
+        self.cmd_last = None
+        self.repeat = 0
+        self.repeat_last = None
+        self.t_ok = None
+        self.t_ok_last = None
+        self.start = 0
+        self.start_last = 0
+        self.changed = False
+        self.prev = True
+
+    def __logHandler(self, rise):
+        thisComeInTime = time.monotonic_ns()
+
+        # update time
+        curtime = time.monotonic_ns() - self.start
+        self.start = thisComeInTime
+
+        if curtime >= 8500*1000 and curtime <= 9500*1000:
+            self.ir_step = 1
+            return
+
+        if self.ir_step == 1:
+            if curtime >= 4000*1000 and curtime <= 5000*1000:
+                self.ir_step = 2
+                self.recived_ok = False
+                self.ir_count = 0
+                self.repeat = 0
+            elif curtime >= 2000*1000 and curtime <= 3000*1000:  # Long press to repeat
+                self.ir_step = 3
+                self.ir_step += 1
+                self.repeat += 1
+
+        elif self.ir_step == 2:  # receive 4 bytes
+            self.buf64[self.ir_count] = curtime
+            self.ir_count += 1
+            if self.ir_count >= 64:
+                self.recived_ok = True
+                self.t_ok = self.start #Record the last ok time
+                self.ir_step = 0
+
+        elif self.ir_step >= 3:  # repeat
+            self.repeat = 0
+
+
+    def __check_cmd(self):
+        byte4 = 0
+        for i in range(32):
+            x = i * 2
+            t = self.buf64[x] + self.buf64[x+1]
+            byte4 <<= 1
+            if t >= 1800*1000 and t <= 2800*1000:
+                byte4 += 1
+        user_code_hi = (byte4 & 0xff000000) >> 24
+        user_code_lo = (byte4 & 0x00ff0000) >> 16
+        data_code = (byte4 & 0x0000ff00) >> 8
+        data_code_r = byte4 & 0x000000ff
+        self.cmd = data_code
+
+    def __check_edge(self, prev, cur):
+        if prev == True and cur == False:
+            return 'falling'
+        elif prev == False and cur == True:
+            return 'rising'
+        else:
+            return 'none'
+
+    def scan(self):
+        # check edge
+        cur = self.irRecv.value
+        edge = self.__check_edge(self.prev, cur)
+        self.prev = cur
+        # simulate interrupt
+        if edge == 'rising':
+            self.__logHandler(True)
+        elif edge == 'falling':
+            self.__logHandler(False)
+
+        # data received
+        if self.recived_ok:
+            self.__check_cmd()
+            self.recived_ok = False
+
+        # data has changed()
+        if self.cmd != self.cmd_last or self.repeat != self.repeat_last or self.t_ok != self.t_ok_last:
+            self.changed = True
+        else:
+            self.changed = False
+
+        # renew
+        self.cmd_last = self.cmd
+        self.repeat_last = self.repeat
+        self.t_ok_last = self.t_ok
+        # Corresponding button character
+        s = self.CODE.get(self.cmd)
+        return self.changed, s, self.repeat, self.t_ok
+
+
+
+
+
+
+# Commands
+_LCD_CLEARDISPLAY = const(0x01)
+_LCD_RETURNHOME = const(0x02)
+_LCD_ENTRYMODESET = const(0x04)
+_LCD_DISPLAYCONTROL = const(0x08)
+_LCD_CURSORSHIFT = const(0x10)
+_LCD_FUNCTIONSET = const(0x20)
+_LCD_SETCGRAMADDR = const(0x40)
+_LCD_SETDDRAMADDR = const(0x80)
+
+# Flags for display entry mode
+_LCD_ENTRYRIGHT = const(0x00)
+_LCD_ENTRYLEFT = const(0x02)
+_LCD_ENTRYSHIFTINCREMENT = const(0x01)
+_LCD_ENTRYSHIFTDECREMENT = const(0x00)
+
+# Flags for display on/off control
+_LCD_DISPLAYON = const(0x04)
+_LCD_DISPLAYOFF = const(0x00)
+_LCD_CURSORON = const(0x02)
+_LCD_CURSOROFF = const(0x00)
+_LCD_BLINKON = const(0x01)
+_LCD_BLINKOFF = const(0x00)
+
+# Flags for display/cursor shift
+_LCD_DISPLAYMOVE = const(0x08)
+_LCD_CURSORMOVE = const(0x00)
+_LCD_MOVERIGHT = const(0x04)
+_LCD_MOVELEFT = const(0x00)
+
+# Flags for function set
+_LCD_8BITMODE = const(0x10)
+LCD_4BITMODE = const(0x00)
+_LCD_2LINE = const(0x08)
+_LCD_1LINE = const(0x00)
+_LCD_5x10DOTS = const(0x04)
+_LCD_5x8DOTS = const(0x00)
+
+# Flags for backlight control
+LCD_BACKLIGHT = const(0x08)
+LCD_NOBACKLIGHT = const(0x00)
+
+# Flags for RS pin modes
+_RS_INSTRUCTION = const(0x00)
+_RS_DATA = const(0x01)
+
+# Pin bitmasks
+PIN_ENABLE = const(0x4)
+PIN_READ_WRITE = const(0x2)
+PIN_REGISTER_SELECT = const(0x1)
+
+class CursorMode:
+    HIDE = const(_LCD_CURSOROFF | _LCD_BLINKOFF)
+    LINE = const(_LCD_CURSORON | _LCD_BLINKOFF)
+    BLINK = const(_LCD_CURSOROFF | _LCD_BLINKON)
+
+MICROSECOND = 1e-6
+MILLISECOND = 1e-3
+
+class LCD:
+    def __init__(self, interface, num_cols=20, num_rows=4, char_height=8):
+        """
+        Character LCD controller.
+
+        :param interface: Communication interface, such as I2CInterface
+        :param num_rows: Number of display rows (usually 1, 2 or 4). Default: 4.
+        :param num_cols: Number of columns per row (usually 16 or 20). Default 20.
+        :param char_height: Some 1 line displays allow a font height of 10px.
+                Allowed: 8 or 10. Default: 8.
+        """
+        self.interface = interface
+
+        if char_height not in (8, 10):
+            raise ValueError('The ``char_height`` argument should be either 8 or 10.')
+        self.char_height = char_height
+
+        self.num_rows = num_rows
+        self.num_cols = num_cols
+
+        # get row addresses (varies based on display size)
+        self._row_offsets = (0x00, 0x40, self.num_cols, 0x40 + self.num_cols)
+
+        # Setup initial display configuration
+        displayfunction = self.interface.data_bus_mode | _LCD_5x8DOTS
+        if self.num_rows == 1:
+            displayfunction |= _LCD_1LINE
+        elif self.num_rows in (2, 4):
+            # LCD only uses two lines on 4 row displays
+            displayfunction |= _LCD_2LINE
+        if self.char_height == 10:
+            # For some 1 line displays you can select a 10px font.
+            displayfunction |= _LCD_5x10DOTS
+
+        # Choose 4 or 8 bit mode
+        self.command(0x03)
+        time.sleep(4.5*MILLISECOND)
+        self.command(0x03)
+        time.sleep(4.5*MILLISECOND)
+        self.command(0x03)
+        if self.interface.data_bus_mode == LCD_4BITMODE:
+            # Hitachi manual page 46
+            time.sleep(100*MICROSECOND)
+            self.command(0x02)
+        elif self.interface.data_bus_mode == _LCD_8BITMODE:
+            # Hitachi manual page 45
+            self.command(0x30)
+            time.sleep(4.5*MILLISECOND)
+            self.command(0x30)
+            time.sleep(100*MICROSECOND)
+            self.command(0x30)
+        else:
+            raise ValueError('Invalid data bus mode: {}'.format(self.interface.data_bus_mode))
+
+        # Write configuration to display
+        self.command(_LCD_FUNCTIONSET | displayfunction)
+        time.sleep(50*MICROSECOND)
+
+        # Configure entry mode. Define internal fields.
+        self.command(_LCD_ENTRYMODESET | _LCD_ENTRYLEFT)
+        time.sleep(50*MICROSECOND)
+
+        # Configure display mode. Define internal fields.
+        self._display_mode = _LCD_DISPLAYON
+        self._cursor_mode = CursorMode.HIDE
+        self.command(_LCD_DISPLAYCONTROL | self._display_mode | self._cursor_mode)
+        time.sleep(50*MICROSECOND)
+
+        self.clear()
+
+    def close(self):
+        self.interface.deinit()
+
+    def set_backlight(self, value):
+        self.interface.backlight = value
+
+    def set_display_enabled(self, value):
+        self._display_mode = _LCD_DISPLAYON if value else _LCD_DISPLAYOFF
+        self.command(_LCD_DISPLAYCONTROL | self._display_mode | self._cursor_mode)
+        time.sleep(50*MICROSECOND)
+
+    def set_cursor_mode(self, value):
+        self._cursor_mode = value
+        self.command(_LCD_DISPLAYCONTROL | self._display_mode | self._cursor_mode)
+        time.sleep(50*MICROSECOND)
+
+    def cursor_pos(self):
+        """The cursor position as a 2-tuple (row, col)."""
+        return (self._row, self._col)
+
+    def set_cursor_pos(self, row, col):
+        if not (0 <= row < self.num_rows):
+            raise ValueError('row should be in range 0-{}'.format(self.num_rows - 1))
+        if not (0 <= col < self.num_cols):
+            raise ValueError('col should be in range 0-{}'.format(self.num_cols - 1))
+        self._row = row
+        self._col = col
+        self.command(_LCD_SETDDRAMADDR | self._row_offsets[row] + col)
+        time.sleep(50*MICROSECOND)
+
+    def print(self, string):
+        """
+        Write the specified unicode string to the display.
+        A newline ('\n') will advance to the left side of the next row.
+        Lines that are too long automatically continue on next line.
+
+        Only characters with an ``ord()`` value between 0 and 255 are currently
+        supported.
+
+        """
+        for char in string:
+            if char == '\n':
+                # Advance to next row, at left side. Wrap around to top row if at bottom.
+                self.set_cursor_pos((self._row + 1) % self.num_rows, 0)
+            else:
+                self.write(ord(char))
+
+    def clear(self):
+        """Overwrite display with blank characters and reset cursor position."""
+        self.command(_LCD_CLEARDISPLAY)
+        time.sleep(2*MILLISECOND)
+        self.home()
+
+    def home(self):
+        """Set cursor to initial position and reset any shifting."""
+        self.command(_LCD_RETURNHOME)
+        self._row = 0
+        self._col = 0
+        time.sleep(2*MILLISECOND)
+
+    def shift_display(self, amount):
+        """Shift the display. Use negative amounts to shift left and positive
+        amounts to shift right."""
+        if amount == 0:
+            return
+        direction = _LCD_MOVERIGHT if amount > 0 else _LCD_MOVELEFT
+        for i in range(abs(amount)):
+            self.command(_LCD_CURSORSHIFT | _LCD_DISPLAYMOVE | direction)
+            time.sleep(50*MICROSECOND)
+
+    def create_char(self, location, bitmap):
+        """Create a new character.
+
+        The HD44780 supports up to 8 custom characters (location 0-7).
+
+        :param location: The place in memory where the character is stored.
+            Values need to be integers between 0 and 7.
+        :type location: int
+        :param bitmap: The bitmap containing the character. This should be a
+            bytearray of 8 numbers, each representing a 5 pixel row.
+        :type bitmap: bytearray
+        :raises AssertionError: Raised when an invalid location is passed in or
+            when bitmap has an incorrect size.
+
+        Example:
+
+        .. sourcecode:: python
+
+            >>> smiley = bytearray(
+            ...     0b00000,
+            ...     0b01010,
+            ...     0b01010,
+            ...     0b00000,
+            ...     0b10001,
+            ...     0b10001,
+            ...     0b01110,
+            ...     0b00000,
+            ... )
+            >>> lcd.create_char(0, smiley)
+
+        """
+        if not (0 <= location <= 7):
+            raise ValueError('Only locations 0-7 are valid.')
+        if len(bitmap) != 8:
+            raise ValueError('Bitmap should have exactly 8 rows.')
+
+        # Store previous position
+        save_row = self._row
+        save_col = self._col
+
+        # Write character to CGRAM
+        self.command(_LCD_SETCGRAMADDR | location << 3)
+        for row in bitmap:
+            self.interface.send(row, _RS_DATA)
+
+        # Restore cursor pos
+        self.set_cursor_pos(save_row, save_col)
+
+    def command(self, value):
+        """Send a raw command to the LCD."""
+        self.interface.send(value, _RS_INSTRUCTION)
+
+    def write(self, value):
+        """Write a raw character byte to the LCD."""
+        self.interface.send(value, _RS_DATA)
+        if self._col < self.num_cols - 1:
+            # Char was placed on current line. No need to reposition cursor.
+            self._col += 1
+        else:
+            # At end of line: go to left side next row. Wrap around to first row if on last row.
+            self._row = (self._row + 1) % self.num_rows
+            self._col = 0
+
+        self.set_cursor_pos(self._row, self._col)
+
+class I2CPCF8574Interface:
+
+    # Bit values to turn backlight on/off. Indexed by a boolean.
+    _BACKLIGHT_VALUES = (LCD_NOBACKLIGHT, LCD_BACKLIGHT)
+
+    def __init__(self, i2c, address):
+        """
+        CharLCD via PCF8574 I2C port expander.
+
+        Pin mapping::
+
+            7  | 6  | 5  | 4  | 3  | 2  | 1  | 0
+            D7 | D6 | D5 | D4 | BL | EN | RW | RS
+
+        :param address: The I2C address of your LCD.
+        """
+        self.address = address
+
+        self._backlight_pin_state = LCD_BACKLIGHT
+
+        self.i2c = i2c
+        self.i2c_device = I2CDevice(self.i2c, self.address)
+        self.data_buffer = bytearray(1)
+
+    def deinit(self):
+        self.i2c.deinit()
+
+    @property
+    def data_bus_mode(self):
+        return LCD_4BITMODE
+
+    @property
+    def backlight(self):
+        return self._backlight_pin_state == LCD_BACKLIGHT
+
+    @backlight.setter
+    def backlight(self, value):
+        self._backlight_pin_state = self._BACKLIGHT_VALUES[value]
+        with self.i2c_device:
+            self._i2c_write(self._backlight_pin_state)
+
+    # Low level commands
+
+    def send(self, value, rs_mode):
+        """Send the specified value to the display in 4-bit nibbles.
+        The rs_mode is either ``_RS_DATA`` or ``_RS_INSTRUCTION``."""
+        self._write4bits(rs_mode | (value & 0xF0) | self._backlight_pin_state)
+        self._write4bits(rs_mode | ((value << 4) & 0xF0) | self._backlight_pin_state)
+
+    def _write4bits(self, value):
+        """Pulse the `enable` flag to process value."""
+        with self.i2c_device:
+            self._i2c_write(value & ~PIN_ENABLE)
+            # This 1us delay is probably unnecessary, given the time needed
+            # to execute the statements.
+            microcontroller.delay_us(1)
+            self._i2c_write(value | PIN_ENABLE)
+            microcontroller.delay_us(1)
+            self._i2c_write(value & ~PIN_ENABLE)
+        # Wait for command to complete.
+        microcontroller.delay_us(100)
+
+    def _i2c_write(self, value):
+        self.data_buffer[0] = value
+        self.i2c_device.write(self.data_buffer)
+
+class LCD1602:
+    def __init__(self):
+        self.lcd = LCD(I2CPCF8574Interface(_get_shared_i2c(), 0X27), num_rows=2, num_cols=16)
+    def cleanup(self):
+        self.I2C.deinit()
+
+#lcd_putstr = LCD1602()
+
+class DisplayLetter:
+    def __init__(self):
+        self.i2c = _get_shared_i2c()
+        self.display = matrix.Matrix16x8(self.i2c)
+
+    def show_letters(self, letter_A, letter_B):
+        for row in range(8):
+            for col in range(8):
+                if (letter_A[row] >> col) & 0x01:
+                    self.display.pixel(col, row, 1)
+
+                if (letter_B[row] >> col) & 0x01:
+                    self.display.pixel(col+8, row, 1)
+
+        self.display.show()
+
+    def cleanup(self):
+        self.i2c.deinit()
+
+
