@@ -1,0 +1,24 @@
+
+# settings.toml
+
+# --- Credenciales Wi-Fi (Estándar CircuitPython) ---
+CIRCUITPY_WIFI_SSID = ""
+CIRCUITPY_WIFI_PASSWORD = ""
+
+# --- Configuración del Broker MQTT ---
+# (broker autoalojado Mosquitto [9, 10])
+MQTT_BROKER = "10.109.5.8"
+MQTT_PORT = 1883
+MQTT_USER = ""
+MQTT_PASSWORD = ""
+
+
+# --- Otros parámetros de configuración ---
+TIMEZONE = "Europe/Madrid"
+HTTP_USER = "adrian"
+HTTP_PASSWORD = "robot123"
+TERMINAL_STATUS_INTERVAL = 2.0
+STATUS_REFRESH_SECONDS = 3.0
+READ_DURING_MOVE_SECONDS = 0.5
+SEQUENCE_PAUSE_SECONDS = 0
+
