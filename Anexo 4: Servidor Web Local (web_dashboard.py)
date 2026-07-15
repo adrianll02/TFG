@@ -1,0 +1,729 @@
+
+import json
+import math
+import time
+
+_state = {
+    "pool": None,
+    "socket": None,
+    "wifi": None,
+    "port": 80,
+    "handle_command": None,
+    "status_getter": None,
+    "format_status_lines": None,
+    "status": None,
+    "auth_user": None,
+    "auth_password": None,
+    "auth_session": None,
+}
+
+def _sanitize_for_json(value):
+    """Return data that json.dumps() can encode reliably."""
+    if isinstance(value, dict):
+        return {key: _sanitize_for_json(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_for_json(val) for val in value]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return float(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", "ignore")
+        except Exception:
+            return None
+    if isinstance(value, memoryview):
+        return _sanitize_for_json(bytes(value))
+    return value
+
+def start_dashboard(
+    pool,
+    wifi_radio,
+    port,
+    handle_command_cb,
+    status_getter,
+    format_status_lines,
+    auth_user=None,
+    auth_password=None,
+):
+    """Initialize HTTP dashboard server/state."""
+    _state["pool"] = pool
+    _state["wifi"] = wifi_radio
+    _state["port"] = port
+    _state["handle_command"] = handle_command_cb
+    _state["status_getter"] = status_getter
+    _state["format_status_lines"] = format_status_lines
+    _state["auth_user"] = str(auth_user) if auth_user else None
+    _state["auth_password"] = str(auth_password) if auth_password else None
+    _state["auth_session"] = None
+    refresh_status()
+    _init_server()
+
+def update_dashboard_status(status):
+    if status is not None:
+        _state["status"] = status
+
+def refresh_status():
+    getter = _state.get("status_getter")
+    if getter is None:
+        return
+    try:
+        snapshot = getter()
+    except Exception:
+        snapshot = None
+    if snapshot is not None:
+        _state["status"] = snapshot
+
+def poll_dashboard():
+    server = _state.get("socket")
+    if server is None:
+        return
+    try:
+        conn, _addr = server.accept()
+    except OSError:
+        return
+    except Exception as err:
+        print("[warn] HTTP accept error:", err)
+        return
+
+    try:
+        conn.settimeout(1)
+    except Exception:
+        pass
+
+    try:
+        buf = bytearray(1024)
+        length = conn.recv_into(buf)
+    except Exception as err:
+        err_code = getattr(err, "errno", None)
+        err_text = str(err).upper()
+        if err_code in (11, 116) or "EAGAIN" in err_text or "ETIMEDOUT" in err_text:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        print("[warn] HTTP recv error:", err)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+
+    if not length:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+
+    request = bytes(memoryview(buf)[:length])
+    try:
+        first_line = request.split(b"\r\n", 1)[0].decode("utf-8", "ignore")
+    except Exception:
+        first_line = ""
+
+    method = "GET"
+    path = "/"
+    if first_line:
+        parts = first_line.split()
+        if len(parts) >= 2:
+            method = parts[0]
+            path = parts[1]
+
+    route, _, query = path.partition("?")
+    # Normalizar rutas triviales del navegador
+    if route == "/favicon.ico":
+        # Responder rapido con 404 sin tocar autenticacion
+        try:
+            _send_all(conn, build_http_response("", "404 Not Found", "text/plain; charset=utf-8", [("Cache-Control", "no-store")]))
+            try:
+                time.sleep(0.05)
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return
+    headers = _parse_headers(request)
+
+    authorized, auth_response = _check_authorization(route, query, headers)
+    if not authorized:
+        body_resp, status_resp, content_resp, extra_resp = auth_response
+        try:
+            _send_all(conn, build_http_response(body_resp, status_resp, content_resp, extra_resp))
+            try:
+                time.sleep(0.05)
+            except Exception:
+                pass
+        except Exception as err:
+            print("[warn] HTTP auth send error:", err)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return
+
+    status_code = "200 OK"
+    content_type = "text/html; charset=utf-8"
+    base_headers = [("Cache-Control", "no-store")]
+    extra_headers = list(base_headers)
+    message = None
+    body = None
+
+    status_snapshot = _ensure_status()
+
+    if route == "/status.json":
+        payload = dict(status_snapshot) if isinstance(status_snapshot, dict) else {}
+        if _state["format_status_lines"]:
+            try:
+                payload["_text"] = _state["format_status_lines"](status_snapshot)
+            except Exception:
+                payload["_text"] = []
+        payload = _sanitize_for_json(payload)
+        body = json.dumps(payload)
+        content_type = "application/json"
+    elif route in ("/", ""):
+        message = get_query_param(query, "msg")
+        body = render_dashboard(status_snapshot, message)
+    elif route == "/command" and method == "GET":
+        cmd_value = get_query_param(query, "cmd")
+        if not cmd_value:
+            servo_value = get_query_param(query, "servo")
+            if servo_value is not None and servo_value != "":
+                cmd_value = "servo " + servo_value
+        if cmd_value:
+            handled, note = _handle_command(cmd_value)
+            safe_note = (note or "")[:120]
+            is_ajax = headers.get("x-command-request") == "ajax"
+            if is_ajax:
+                body = json.dumps({
+                    "handled": bool(handled),
+                    "note": safe_note,
+                })
+                content_type = "application/json"
+                extra_headers = list(base_headers)
+            else:
+                status_code = "303 See Other"
+                fallback_note = safe_note or ("OK" if handled else "Comando sin nota")
+                redirect_target = "/?msg=" + url_encode(fallback_note)
+                body = "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0; url=%s'></head><body><p>%s</p></body></html>" % (redirect_target, html_escape(fallback_note))
+                content_type = "text/html; charset=utf-8"
+                extra_headers = [("Cache-Control", "no-store"), ("Location", redirect_target)]
+        else:
+            status_code = "400 Bad Request"
+            body = json.dumps({"handled": False, "note": "Proporciona ?cmd="})
+            content_type = "application/json"
+    else:
+        status_code = "404 Not Found"
+        body = "<!DOCTYPE html><html><body><h1>404</h1><p>Recurso no encontrado.</p></body></html>"
+
+    try:
+        _send_all(conn, build_http_response(body, status_code, content_type, extra_headers))
+        # Pequeño retardo para estabilidad de red en microcontrolador
+        try:
+            time.sleep(0.05)
+        except Exception:
+            pass
+    except Exception as err:
+        print("[warn] HTTP send error:", err)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _handle_command(cmd_value):
+    handler = _state.get("handle_command")
+    if handler is None:
+        return False, "Sin handler"
+    handled, note = handler(cmd_value)
+    if handled:
+        print(f"[info] Comando web: {cmd_value}")
+    else:
+        print(f"[warn] Comando desconocido (web): {cmd_value}")
+    refresh_status()
+    return handled, note
+
+def _init_server():
+    pool = _state.get("pool")
+    wifi_radio = _state.get("wifi")
+    port = _state.get("port", 80)
+    if pool is None or wifi_radio is None:
+        return
+    try:
+        sock = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+        try:
+            sol_socket = getattr(pool, "SOL_SOCKET", None)
+            so_reuseaddr = getattr(pool, "SO_REUSEADDR", None)
+            if sol_socket is not None and so_reuseaddr is not None:
+                sock.setsockopt(sol_socket, so_reuseaddr, 1)
+        except Exception:
+            pass
+        sock.bind(("0.0.0.0", port))
+        sock.listen(2)
+        sock.settimeout(0)
+        _state["socket"] = sock
+        print(f"[🌍] HTTP listo en http://{wifi_radio.ipv4_address}:{port}")
+    except Exception as err:
+        _state["socket"] = None
+        print("[warn] HTTP server init error:", err)
+
+def _ensure_status():
+    status_snapshot = _state.get("status")
+    if status_snapshot is None:
+        refresh_status()
+        status_snapshot = _state.get("status")
+    if status_snapshot is None:
+        status_snapshot = {}
+    return status_snapshot
+
+def _parse_headers(request_bytes):
+    headers = {}
+    try:
+        head, _ = request_bytes.split(b"\r\n\r\n", 1)
+    except ValueError:
+        head = request_bytes
+    lines = head.split(b"\r\n")[1:]
+    for raw in lines:
+        if b":" not in raw:
+            continue
+        name, value = raw.split(b":", 1)
+        try:
+            key = name.decode("utf-8", "ignore").strip().lower()
+            val = value.decode("utf-8", "ignore").strip()
+            headers[key] = val
+        except Exception:
+            continue
+    return headers
+
+def _parse_cookies(cookie_header):
+    cookies = {}
+    if not cookie_header:
+        return cookies
+    parts = cookie_header.split(";")
+    for part in parts:
+        segment = part.strip()
+        if not segment:
+            continue
+        name, _, value = segment.partition("=")
+        if not name:
+            continue
+        cookies[name] = value
+    return cookies
+
+def url_decode(text):
+    if text is None:
+        return ""
+    result = []
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if ch == "+":
+            result.append(" ")
+            i += 1
+            continue
+        if ch == "%" and i + 2 < length:
+            hex_value = text[i + 1:i + 3]
+            try:
+                result.append(chr(int(hex_value, 16)))
+                i += 3
+                continue
+            except Exception:
+                pass
+        result.append(ch)
+        i += 1
+    return "".join(result)
+
+def url_encode(text):
+    if text is None:
+        return ""
+    safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+    out = []
+    for ch in str(text):
+        if ch in safe:
+            out.append(ch)
+        elif ch == " ":
+            out.append("+")
+        else:
+            out.append("%02X" % ord(ch))
+    return "".join(out)
+
+def html_escape(text):
+    if text is None:
+        return ""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def get_query_param(query, name):
+    if not query:
+        return None
+    target = name + "="
+    for part in query.split("&"):
+        if part.startswith(target):
+            return url_decode(part[len(target):])
+    return None
+
+def render_login_page(error=None, username=""):
+    message_block = ""
+    if error:
+        message_block = "<p class='error'>%s</p>" % html_escape(error)
+    username_value = html_escape(username) if username else ""
+    return "".join([
+        "<!DOCTYPE html>",
+        "<html lang='es'>",
+        "<head>",
+        "<meta charset='utf-8'>",
+        "<title>Acceso Robot</title>",
+        "<style>",
+        "body{font-family:Arial,Helvetica,sans-serif;background:#0e1117;color:#f5f5f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}",
+        ".card{background:#161b22;padding:2rem;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,0.35);width:280px;text-align:center;}",
+        "h1{margin-top:0;font-size:1.4rem;}",
+        "form{display:flex;flex-direction:column;gap:0.75rem;margin-top:1rem;}",
+        "input[type=text],input[type=password]{padding:0.5rem;border:1px solid #30363d;border-radius:8px;background:#0d1117;color:#f5f5f5;}",
+        "button{padding:0.5rem;border:none;border-radius:8px;background:#238636;color:#fff;font-weight:bold;cursor:pointer;}",
+        "button:hover{background:#2ea043;}",
+        ".hint{font-size:0.8rem;color:#8b949e;margin-top:0.5rem;}",
+        ".error{color:#ff7b72;margin:0;}",
+        "</style>",
+        "</head>",
+        "<body>",
+        "<div class='card'>",
+        "<h1>Panel protegido</h1>",
+        message_block,
+        "<form method='get' action='/'>",
+        "<input type='text' name='user' placeholder='Usuario' autocomplete='username' required value='%s'>" % username_value,
+        "<input type='password' name='password' placeholder='Password' autocomplete='current-password' required>",
+        "<button type='submit'>Entrar</button>",
+        "</form>",
+        "<p class='hint'>Introduce usuario y contraseña para acceder.</p>",
+        "</div>",
+        "</body>",
+        "</html>",
+    ])
+
+def _check_authorization(route, query, headers):
+    username = _state.get("auth_user")
+    password = _state.get("auth_password")
+    if username is None and password is None:
+        return True, None
+
+    session_token = _state.get("auth_session")
+    cookies = _parse_cookies(headers.get("cookie"))
+    if session_token and cookies.get("dash_session") == session_token:
+        return True, None
+
+    provided_user = get_query_param(query, "user") if query else None
+    provided_pass = get_query_param(query, "password") if query else None
+    submitted = (provided_user is not None) or (provided_pass is not None)
+
+    if submitted:
+        user_value = provided_user or ""
+        pass_value = provided_pass or ""
+        missing = False
+        if username is not None and not user_value:
+            missing = True
+        if password is not None and not pass_value:
+            missing = True
+        user_ok = (username is None) or (user_value == username)
+        pass_ok = (password is None) or (pass_value == password)
+        if not missing and user_ok and pass_ok:
+            token = str(int(time.monotonic() * 1000))
+            _state["auth_session"] = token
+            redirect_target = "/"
+            headers = [
+                ("Location", redirect_target),
+                ("Set-Cookie", "dash_session=%s; Max-Age=86400; Path=/" % token),
+                ("Cache-Control", "no-store"),
+            ]
+            body = "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='0; url=%s'></head><body><p>Acceso concedido</p></body></html>" % redirect_target
+            return False, (body, "303 See Other", "text/html; charset=utf-8", headers)
+
+        error_text = "Introduce usuario y contraseña" if missing else "Credenciales incorrectas"
+        body = render_login_page(error_text, user_value)
+        headers = [("Cache-Control", "no-store")]
+        return False, (body, "401 Unauthorized", "text/html; charset=utf-8", headers)
+
+    prefill_user = username or ""
+    body = render_login_page(None, prefill_user)
+    headers = [("Cache-Control", "no-store")]
+    return False, (body, "401 Unauthorized", "text/html; charset=utf-8", headers)
+
+def render_dashboard(status, message=None):
+    status = dict(status or {})
+
+    line_vals = status.get("line")
+    if isinstance(line_vals, (list, tuple)) and len(line_vals) >= 3:
+        line_text = "L=%s M=%s R=%s" % tuple(int(bool(v)) for v in line_vals[:3])
+    else:
+        line_text = "n/d"
+
+    lcd_lines = status.get("lcd") or ("", "")
+    if isinstance(lcd_lines, (list, tuple)):
+        lcd_line1 = lcd_lines[0] if len(lcd_lines) >= 1 else ""
+        lcd_line2 = lcd_lines[1] if len(lcd_lines) >= 2 else ""
+    else:
+        lcd_line1 = lcd_lines
+        lcd_line2 = ""
+
+    command_info = status.get("command")
+    if isinstance(command_info, (list, tuple)):
+        command_text = " ".join(str(part) for part in command_info if part)
+    else:
+        command_text = command_info or ""
+
+    distance_value = status.get("distance_cm")
+    distance_text = "n/d" if distance_value is None else f"{distance_value} cm"
+    servo_value = status.get("servo")
+    servo_text = "n/d" if servo_value is None else servo_value
+    ping_value = status.get("ping")
+    if ping_value is not None:
+        ping_text = f"#{ping_value}"
+    else:
+        ping_text = "n/d"
+    speed_value = status.get("speed")
+    speed_text = "n/d" if speed_value is None else speed_value
+
+    status_lines = ""
+    formatter = _state.get("format_status_lines")
+    if formatter is not None:
+        try:
+            status_lines = "\n".join(formatter(status))
+        except Exception:
+            status_lines = ""
+
+    html_parts = [
+        "<!DOCTYPE html>",
+        "<html lang='es'>",
+        "<head>",
+        "<meta charset='utf-8'>",
+        "<title>Robot Dashboard</title>",
+        "<style>",
+        "body{font-family:Arial,Helvetica,sans-serif;padding:1rem;background:#0e1117;color:#f5f5f5;}",
+        "h1{font-size:1.5rem;margin:0 0 1rem 0;}",
+        "section{margin-bottom:1rem;padding:1rem;border-radius:8px;background:#161b22;}",
+        "table{width:100%;border-collapse:collapse;}",
+        "td{padding:0.4rem;border-bottom:1px solid #2d333b;}",
+        "tr:last-child td{border-bottom:none;}",
+        "label{display:block;margin-bottom:0.5rem;}",
+        "input[type=text],textarea{width:100%;padding:0.5rem;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#f5f5f5;}",
+        "button{padding:0.5rem 1rem;border:none;border-radius:6px;background:#238636;color:#fff;font-weight:bold;cursor:pointer;}",
+        "button:hover{background:#2ea043;}",
+        ".message{padding:0.5rem 0;margin:0 0 1rem;color:#fff;}",
+        ".error{color:#ff7b72;}",
+        "pre{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:0.75rem;white-space:pre-wrap;}",
+        ".controls{display:grid;grid-template-columns:repeat(3,80px);grid-gap:0.5rem;justify-content:center;margin-top:0.5rem;}",
+        ".controls button{background:#1f6feb;}",
+        ".controls button.stop{background:#d73a49;}",
+        ".servo-wrapper{display:flex;flex-direction:column;gap:0.75rem;align-items:center;}",
+        ".servo-display{font-size:1.4rem;font-weight:bold;}",
+        ".servo-slider{width:100%;max-width:260px;}",
+        ".servo-slider input{width:100%;}",
+        ".servo-inputs{display:flex;gap:0.5rem;align-items:center;}",
+        ".servo-inputs label{font-size:0.9rem;color:#8b949e;}",
+        ".servo-inputs input{width:80px;padding:0.4rem;border:1px solid #30363d;border-radius:6px;background:#0d1117;color:#f5f5f5;text-align:center;}",
+        ".servo-inputs button{background:#1f6feb;}",
+        ".servo-hint{font-size:0.8rem;color:#8b949e;text-align:center;margin:0;}",
+        ".queue-actions{display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem;}",
+        ".queue-actions button{background:#1f6feb;}",
+        ".queue-status{font-size:0.85rem;color:#8b949e;}",
+        "</style>",
+        "</head>",
+        "<body>",
+        "<h1>Panel del Robot</h1>",
+    ]
+
+    if message:
+        css_class = "message"
+        if message.lower().startswith("error") or "desconocido" in message.lower():
+            css_class += " error"
+        html_parts.append(f"<p id='flash' class='{css_class}'>{html_escape(message)}</p>")
+    else:
+        html_parts.append("<p id='flash' class='message' style='display:none'></p>")
+
+    html_parts.extend([
+        "<section>",
+        "<table>",
+        f"<tr><td>IP</td><td id='ip'>{html_escape(status.get('ip'))}</td></tr>",
+        f"<tr><td>Ultimo ping</td><td id='ping'>{html_escape(ping_text)}</td></tr>",
+        "<tr><td>Ultima lectura</td><td id='last-refresh'>n/d</td></tr>",
+        f"<tr><td>Ultrasonidos</td><td id='distance'>{html_escape(distance_text)}</td></tr>",
+        f"<tr><td>Servo</td><td id='servo'>{html_escape(servo_text)}</td></tr>",
+        f"<tr><td>Velocidad</td><td id='speed'>{html_escape(speed_text)}</td></tr>",
+        f"<tr><td>Sensores de linea</td><td id='line'>{html_escape(line_text)}</td></tr>",
+        f"<tr><td>Ultimo comando</td><td id='command'>{html_escape(command_text)}</td></tr>",
+        f"<tr><td>LCD Linea 1</td><td id='lcd1'>{html_escape(lcd_line1)}</td></tr>",
+        f"<tr><td>LCD Linea 2</td><td id='lcd2'>{html_escape(lcd_line2)}</td></tr>",
+        "</table>",
+        "</section>",
+
+        "<section>",
+        "<h2>Controles rapidos</h2>",
+        "<div class='controls'>",
+        "<span></span>",
+        "<button type='button' data-cmd='forward 100'>Arriba</button>",
+        "<span></span>",
+        "<button type='button' data-cmd='left'>Izquierda</button>",
+        "<button type='button' class='stop' data-cmd='stop'>Stop</button>",
+        "<button type='button' data-cmd='right'>Derecha</button>",
+        "<span></span>",
+        "<button type='button' data-cmd='backward 80'>Abajo</button>",
+        "<span></span>",
+        "</div>",
+        "</section>",
+
+        "<section>",
+        "<h2>Control del servo</h2>",
+        "<form id='servo-form' method='get' action='/command'>",
+        "<div class='servo-wrapper'>",
+        "<div class='servo-display'><output id='servo-angle-display' name='servo_display'>0</output><span>&deg;</span></div>",
+        "<div class='servo-slider'>",
+        "<input id='servo-range-input' name='servo_range' type='range' min='-90' max='90' value='0' oninput=\"var f=this.form;var v=this.value;if(f&&f.elements){var n=f.elements['servo'];if(n){n.value=v;}var o=f.elements['servo_display'];if(o){o.value=v;}}\" onchange=\"var f=this.form;var v=this.value;if(f&&f.elements){var n=f.elements['servo'];if(n){n.value=v;}var o=f.elements['servo_display'];if(o){o.value=v;}}\">",
+        "</div>",
+        "<div class='servo-inputs'>",
+        "<label for='servo-angle-input'>Angulo</label>",
+        "<input id='servo-angle-input' name='servo' type='number' min='-90' max='90' step='1' value='0' oninput=\"var f=this.form;var v=this.value;if(f&&f.elements){var r=f.elements['servo_range'];if(r){r.value=v;}var o=f.elements['servo_display'];if(o){o.value=v;}}\">",
+        "<button type='submit' id='servo-send-btn'>Mover</button>",
+        "</div>",
+        "<p class='servo-hint'>Usa el deslizador o escribe un angulo (°).</p>",
+        "</div>",
+        "</form>",
+        "</section>",
+
+        "<section>",
+        "<form id='command-form' method='get' action='/command'>",
+        "<label for='cmd'>Enviar comando MQTT/web</label>",
+        "<input id='cmd' name='cmd' type='text' placeholder='forward, servo 90 o {\"action\":\"left\"}' autocomplete='off'>",
+        "<button type='submit' id='command-send-btn'>Enviar</button>",
+        "</form>",
+        "</section>",
+
+        "<section>",
+        "<h2>Lista de comandos</h2>",
+        "<p class='servo-hint'>Escribe varios comandos (uno por linea) y se enviaran en orden. Ej: forward 60 ts 2</p>",
+        "<form id='queue-form' method='get' action='/command'>",
+        "<textarea id='command-queue' name='cmd' rows='4' placeholder='forward 60\nservo 45\nstop'></textarea>",
+        "<div class='queue-actions'>",
+        "<button type='submit' id='queue-send-btn'>Enviar lista</button>",
+        "<span id='queue-status' class='queue-status'></span>",
+        "</div>",
+        "</form>",
+        "</section>",
+
+        "<section>",
+        "<h2>Estado en texto</h2>",
+        f"<pre id='status-text'>{html_escape(status_lines)}</pre>",
+        "</section>",
+
+        "<script>",
+        "const flash=document.getElementById('flash');",
+        "const commandForm=document.getElementById('command-form');",
+        "const commandInput=document.getElementById('cmd');",
+        "const commandQueueInput=document.getElementById('command-queue');",
+        "const queueSendBtn=document.getElementById('queue-send-btn');",
+        "const commandSendBtn=document.getElementById('command-send-btn');",
+        "const queueStatus=document.getElementById('queue-status');",
+        "const queueForm=document.getElementById('queue-form');",
+        "const servoRange=document.getElementById('servo-range-input');",
+        "const servoNumber=document.getElementById('servo-angle-input');",
+        "const servoSendBtn=document.getElementById('servo-send-btn');",
+        "const servoForm=document.getElementById('servo-form');",
+        "const servoAngleDisplay=document.getElementById('servo-angle-display');",
+        "let servoSendTimer=null;",
+        "let servoPendingUi=0;",
+        "let queueRunning=false;",
+        "function setText(id,value){const el=document.getElementById(id);if(!el){return;}el.textContent=(value===undefined||value===null||value==='')?'n/d':value;}",
+        "function submitCommandInput(){const value=commandInput?commandInput.value.trim():'';if(!value){return;}sendCommand(value);}",
+        "function showFlash(text,isOk){if(!flash){return;}if(!text){flash.style.display='none';flash.textContent='';flash.className='message';return;}flash.textContent=text;flash.style.display='block';flash.className=isOk?'message':'message error';}",
+        "const queueDelay=ms=>new Promise(resolve=>setTimeout(resolve,ms));",
+        "function formatStatusText(data){const lines=[];const pad2=value=>{const str=(''+(value||'')).trim();return(str.length>=2)?str.slice(-2):(' '+str).slice(-2);};lines.push('+-- Robot Status --------------------------------');lines.push('| IP           : '+(data.ip||'n/d'));if(Array.isArray(data.line)&&data.line.length>=3){lines.push('| Line sensors : L='+Number(!!data.line[0])+' M='+Number(!!data.line[1])+' R='+Number(!!data.line[2]));}else{lines.push('| Line sensors : n/d');}if(typeof data.distance_cm==='number'&&!isNaN(data.distance_cm)){lines.push('| Ultrasonic   : '+data.distance_cm.toFixed(1)+' cm');}else{lines.push('| Ultrasonic   : n/d');}if(typeof data.servo==='number'&&!isNaN(data.servo)){lines.push('| Servo angle  : '+data.servo);}else{lines.push('| Servo angle  : n/d');}lines.push('| Motor speed  : '+(data.speed===undefined||data.speed===null?'n/d':data.speed));if(Array.isArray(data.lcd)&&data.lcd.length>=2){lines.push('| LCD line1    : '+(data.lcd[0]||''));lines.push('| LCD line2    : '+(data.lcd[1]||''));}else if(Array.isArray(data.lcd)&&data.lcd.length>=1){lines.push('| LCD line1    : '+(data.lcd[0]||''));}else if(data.lcd){lines.push('| LCD text     : '+data.lcd);}const motors=data.motors;if(motors&&typeof motors==='object'&&!Array.isArray(motors)&&!('direction'in motors)){Object.keys(motors).sort().forEach(key=>{const entry=motors[key]||{};const duty=entry.duty_pct===undefined||entry.duty_pct===null?'n/d':entry.duty_pct;lines.push('| Motor '+pad2(key)+'  : '+(entry.direction||'n/d')+' @ '+duty+'%');});}else if(motors!==undefined){lines.push('| Motors (cmd) : '+motors);}const command=data.command;if(Array.isArray(command)&&command.length){lines.push('| Last command : '+command.filter(Boolean).join(' '));}else if(command){lines.push('| Last command : '+command);}lines.push('+-------------------------------------------------');return lines.join('\n');}",
+        "function clampUi(value){const num=Number(value);if(isNaN(num)){return 0;}return Math.min(90,Math.max(-90,Math.round(num)));}",
+        "function uiToActual(value){return clampUi(value);}",
+        "function actualToUi(value){return clampUi(Number(value));}",
+        "function updateServoUI(actual){if(actual===undefined||actual===null||isNaN(actual)){servoPendingUi=0;if(servoAngleDisplay){servoAngleDisplay.value='n/d';servoAngleDisplay.textContent='n/d';}if(servoRange){servoRange.value='0';}if(servoNumber){servoNumber.value='';}return;}const uiAngle=clampUi(actual);servoPendingUi=uiAngle;if(servoAngleDisplay){servoAngleDisplay.value=uiAngle;servoAngleDisplay.textContent=uiAngle;}if(servoRange){servoRange.value=uiAngle;}if(servoNumber){servoNumber.value=uiAngle;}}",
+        "const REFRESH_TIMEOUT_MS=6500;",
+        "const REFRESH_INTERVAL_MS=5000;",
+        "const FOCUS_REFRESH_DELAY_MS=300;",
+        "let refreshTimer=null;",
+        "let refreshBusy=false;",
+        "function scheduleRefresh(delay){const wait=Math.max(FOCUS_REFRESH_DELAY_MS,delay||REFRESH_INTERVAL_MS);if(refreshTimer){clearTimeout(refreshTimer);}refreshTimer=setTimeout(()=>{refreshTick();},wait);}",
+        "async function refresh(signal){try{setText('last-refresh','Actualizando...');const res=await fetch('/status.json?ts='+Date.now(),{cache:'no-store',signal});if(!res.ok){return;}const data=await res.json();setText('ip',data.ip||'n/d');let pingText='n/d';const seqNumber=typeof data.ping==='number'?data.ping:(typeof data.seq==='number'?data.seq:null);if(seqNumber!==null){pingText='#'+seqNumber;}setText('ping',pingText);setText('distance',data.distance_cm!==undefined&&data.distance_cm!==null?data.distance_cm+' cm':'n/d');if(typeof data.servo==='number'&&!isNaN(data.servo)){setText('servo',data.servo);updateServoUI(data.servo);}setText('speed',data.speed);if(Array.isArray(data.line)&&data.line.length>=3){setText('line','L='+Number(!!data.line[0])+' M='+Number(!!data.line[1])+' R='+Number(!!data.line[2]));}else{setText('line','n/d');}if(data.command){if(Array.isArray(data.command)){setText('command',data.command.filter(Boolean).join(' '));}else{setText('command',data.command);}}else{setText('command','');}if(data.lcd){if(Array.isArray(data.lcd)){setText('lcd1',data.lcd[0]||'');setText('lcd2',data.lcd[1]||'');}else{setText('lcd1',data.lcd);setText('lcd2','');}}const box=document.getElementById('status-text');if(box){if(data._text){const lines=Array.isArray(data._text)?data._text.join('\\n'):data._text;box.textContent=lines;}else{box.textContent=formatStatusText(data);}}setText('last-refresh',new Date().toLocaleTimeString());}catch(err){console.warn('refresh error',err);setText('last-refresh','Error');}}",
+        "async function sendCommand(value){if(!value){return;}try{const res=await fetch('/command?cmd='+encodeURIComponent(value),{cache:'no-store',headers:{'X-Command-Request':'ajax'}});if(!res.ok){throw new Error('http '+res.status);}let handled=true;let note='';const ctype=res.headers.get('Content-Type')||res.headers.get('content-type');if(ctype&&ctype.indexOf('application/json')!==-1){const payload=await res.json();handled=payload.handled!==false;note=payload.note||'';}if(note){showFlash(note,handled);}refreshTick();scheduleRefresh(FOCUS_REFRESH_DELAY_MS);}catch(err){console.error('command error',err);showFlash('Error enviando comando',false);}}",
+        "function scheduleServo(uiAngle){servoPendingUi=clampUi(uiAngle);if(servoSendTimer){return;}servoSendTimer=setTimeout(()=>{servoSendTimer=null;const actual=clampUi(servoPendingUi);sendCommand('servo '+actual);},100);}",
+        "async function runCommandQueue(list){if(!list.length){showFlash('Lista vacia',false);return;}if(queueRunning){showFlash('Ya hay una lista en curso',false);return;}queueRunning=true;if(queueSendBtn){queueSendBtn.disabled=true;queueSendBtn.textContent='Enviando...';}try{for(let i=0;i<list.length;i+=1){const cmd=list[i];showFlash('Enviando ('+(i+1)+'/'+list.length+'): '+cmd,true);await sendCommand(cmd);await queueDelay(150);}if(queueStatus){queueStatus.textContent='Ultima lista: '+list.length+' comandos';}}finally{queueRunning=false;if(queueSendBtn){queueSendBtn.disabled=false;queueSendBtn.textContent='Enviar lista';}}}",
+        "document.querySelectorAll('.controls button').forEach(btn=>btn.addEventListener('click',evt=>{evt.preventDefault();sendCommand(btn.dataset.cmd);}));",
+        "if(servoRange){",
+        "  const _onRangeInput = function(){const v=clampUi(servoRange.value); if(servoAngleDisplay){servoAngleDisplay.textContent=v;} if(servoNumber){servoNumber.value=v;} };",
+        "  servoRange.addEventListener('input', _onRangeInput);",
+        "  servoRange.addEventListener('change', _onRangeInput);",
+        "}",
+        "if(servoNumber){",
+        "  const _onNumberInput = function(){const v=clampUi(servoNumber.value); if(servoRange){servoRange.value=v;} if(servoAngleDisplay){servoAngleDisplay.textContent=v;} };",
+        "  servoNumber.addEventListener('input', _onNumberInput);",
+        "  servoNumber.addEventListener('change', _onNumberInput);",
+        "  servoNumber.addEventListener('keyup', evt=>{if(evt.key==='Enter'){evt.preventDefault();const uiAngle=clampUi(servoNumber.value);updateServoUI(uiAngle);sendCommand('servo '+uiAngle);} });",
+        "}",
+        "if(servoForm){servoForm.addEventListener('submit',evt=>{evt.preventDefault();const source=(servoNumber&&servoNumber.value!=='')?servoNumber:servoRange;const uiAngle=clampUi(source?source.value:0);updateServoUI(uiAngle);sendCommand('servo '+uiAngle);});}",
+        "if(commandForm){commandForm.addEventListener('submit',evt=>{evt.preventDefault();submitCommandInput();});}",
+        "if(queueForm){queueForm.addEventListener('submit',evt=>{evt.preventDefault();const raw=commandQueueInput?commandQueueInput.value:'';const commands=raw.split(/\\r?\\n/).map(line=>line.trim()).filter(Boolean);runCommandQueue(commands);});}",
+        "if(commandInput){commandInput.addEventListener('keydown',evt=>{if(evt.key==='Enter'){evt.preventDefault();submitCommandInput();}});}",
+        "async function refreshTick(){if(refreshBusy){scheduleRefresh(REFRESH_INTERVAL_MS);return;}refreshBusy=true;const controller=new AbortController();const timeoutId=setTimeout(()=>controller.abort(),REFRESH_TIMEOUT_MS);try{await refresh(controller.signal);}catch(err){console.warn('refreshTick error',err);}finally{clearTimeout(timeoutId);refreshBusy=false;scheduleRefresh(REFRESH_INTERVAL_MS);}}",
+        "refreshTick();",
+        "window.addEventListener('focus',()=>{scheduleRefresh(FOCUS_REFRESH_DELAY_MS);});",
+        "</script>",
+
+        "</body>",
+        "</html>",
+    ])
+
+    return "".join(html_parts)
+
+def build_http_response(body, status="200 OK", content_type="text/html; charset=utf-8", extra_headers=None):
+    if isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    else:
+        body_bytes = body or b""
+    lines = [
+        f"HTTP/1.1 {status}",
+        f"Content-Type: {content_type}",
+        f"Content-Length: {len(body_bytes)}",
+        "Connection: close",
+    ]
+    if extra_headers:
+        for key, value in extra_headers:
+            lines.append(f"{key}: {value}")
+    lines.extend(["", ""])
+    header_bytes = "\r\n".join(lines).encode("utf-8")
+    return header_bytes + body_bytes
+
+def _send_all(conn, payload):
+    if not payload:
+        return
+    view = memoryview(payload)
+    total = len(view)
+    sent = 0
+    max_chunk = 1024
+    backoff = 0.01
+    while sent < total:
+        try:
+            end = sent + max_chunk
+            written = conn.send(view[sent:end])
+        except Exception as err:
+            print("[warn] HTTP send chunk error:", err)
+            break
+        if not written:
+            try:
+                time.sleep(backoff)
+            except Exception:
+                pass
+            continue
+        sent += written
+    if sent < total:
+        print("[warn] HTTP response truncated (sent %d of %d bytes)" % (sent, total))
+    if sent < total:
+        print("[warn] HTTP response truncated (sent %d of %d bytes)" % (sent, total))
+
+
