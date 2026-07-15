@@ -1,0 +1,1104 @@
+
+# ============================
+#   ROBOT + MQTT (telemetria)
+# ============================
+
+import time
+import json
+
+import wifi
+import socketpool
+
+import countio
+import board
+import digitalio
+
+from adafruit_minimqtt.adafruit_minimqtt import MQTT
+
+from web_dashboard import start_dashboard, poll_dashboard, update_dashboard_status
+
+try:
+    # Añadimos pull=digitalio.Pull.UP para evitar el ruido eléctrico (pines flotantes)
+    encoder_LF = countio.Counter(board.GP8, edge=countio.Edge.RISE, pull=digitalio.Pull.UP)
+    encoder_RF = countio.Counter(board.GP9, edge=countio.Edge.RISE, pull=digitalio.Pull.UP)
+    encoder_LB = countio.Counter(board.GP10, edge=countio.Edge.RISE, pull=digitalio.Pull.UP)
+    encoder_RB = countio.Counter(board.GP27, edge=countio.Edge.RISE, pull=digitalio.Pull.UP)
+except Exception as err:
+    print("[warn] Error iniciando Encoders:", err)
+    encoder_LF = encoder_RF = encoder_LB = encoder_RB = None
+
+
+
+
+# --- Hardware helpers -----------------------------------------------------
+try:
+    from BPI_PicoW_S3_Car import Motor, Servo
+    import BPI_PicoW_S3_Car as car_module
+except Exception:
+    Motor = None
+    Servo = None
+    car_module = None
+
+motor = Motor() if Motor else None
+
+if car_module is not None and hasattr(car_module, "servo"):
+    servo = getattr(car_module, "servo")
+else:
+    servo = Servo() if Servo else None
+
+servo_pin = getattr(car_module, "SERVO_PIN", None) if car_module else None
+
+line_sensor = None
+ultrasonic = None
+lcd_display = None
+matrix_display = None
+
+if car_module:
+    if hasattr(car_module, "Line_tracking"):
+        try:
+            line_sensor = car_module.Line_tracking()
+        except Exception as err:
+            print("[warn] Line sensor init error:", err)
+            line_sensor = None
+    if hasattr(car_module, "ultra"):
+        try:
+            ultrasonic = getattr(car_module, "ultra")
+        except Exception as err:
+            print("[warn] Ultrasonic init error:", err)
+            ultrasonic = None
+    if hasattr(car_module, "LCD1602"):
+        try:
+            lcd_display = car_module.LCD1602()
+        except Exception as err:
+            print("[warn] LCD init error:", err)
+            lcd_display = None
+    if hasattr(car_module, "DisplayLetter"):
+        try:
+            matrix_display = car_module.DisplayLetter().display
+        except Exception as err:
+            print("[warn] LED matrix init error:", err)
+            matrix_display = None
+
+# --- Configuración --------------------------------------------------------
+
+def load_settings(path="/settings.toml"):
+    cfg = {}
+    try:
+        with open(path, "r") as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = [part.strip() for part in line.split("=", 1)]
+                if value and ((value[0] == value[-1]) and value[0] in "\"\'"):
+                    value = value[1:-1]
+                try:
+                    value = int(value)
+                except Exception:
+                    pass
+                cfg[key] = value
+    except Exception:
+        pass
+    return cfg
+
+cfg = load_settings()
+SSID = cfg.get("CIRCUITPY_WIFI_SSID")
+PASSWORD = cfg.get("CIRCUITPY_WIFI_PASSWORD")
+BROKER = cfg.get("MQTT_BROKER")
+PORT = int(cfg.get("MQTT_PORT", 1883))
+LINE_SENSORS_INVERT = str(cfg.get("INVERT_LINE_SENSORS", "true")).lower() in ("1", "true", "yes", "on")
+HTTP_PORT = int(cfg.get("HTTP_PORT", 80))
+HTTP_USER_RAW = cfg.get("HTTP_USER")
+if HTTP_USER_RAW is None:
+    HTTP_USER = None
+else:
+    HTTP_USER = str(HTTP_USER_RAW).strip()
+    if not HTTP_USER:
+        HTTP_USER = None
+HTTP_PASSWORD_RAW = cfg.get("HTTP_PASSWORD")
+if HTTP_PASSWORD_RAW is None:
+    HTTP_PASSWORD = None
+else:
+    HTTP_PASSWORD = str(HTTP_PASSWORD_RAW).strip()
+    if not HTTP_PASSWORD:
+        HTTP_PASSWORD = None
+MOTOR_DEFAULT_SPEED = int(cfg.get("MOTOR_SPEED", 35))
+STATUS_REFRESH_SECONDS = max(0.1, float(cfg.get("STATUS_REFRESH_SECONDS", 0.1)))
+TERMINAL_STATUS_INTERVAL = max(0.1, float(cfg.get("TERMINAL_STATUS_INTERVAL", 1.0)))
+MOVING_STATUS_REFRESH_SECONDS = max(0.05, float(cfg.get("MOVING_STATUS_REFRESH_SECONDS", 0.2)))
+MOVING_TERMINAL_STATUS_INTERVAL = max(0.1, float(cfg.get("MOVING_TERMINAL_STATUS_INTERVAL", 0.5)))
+SEQUENCE_PAUSE_SECONDS = max(0.0, float(cfg.get("SEQUENCE_PAUSE_SECONDS", 1.0)))
+READ_DURING_MOVE_SECONDS = max(0.0, float(cfg.get("READ_DURING_MOVE_SECONDS", 0.5)))
+
+TOPIC_PUB = "robot/status"
+TOPIC_SUB = "robot/commands"
+
+# --- Estado interno -------------------------------------------------------
+
+last_move = {"direction": None, "speed": None, "when": None}
+last_servo_pos = None
+last_lcd_text = None
+last_command = None
+last_status = None
+motor_speed = None
+command_queue = []
+active_command = None
+active_until = None
+last_move_read_ts = None
+status_publish_enabled = True
+
+# --- Utilidades -----------------------------------------------------------
+
+def parse_speed(value):
+    try:
+        return max(0, min(100, int(value)))
+    except Exception:
+        return None
+
+
+def parse_seconds(value):
+    try:
+        return max(0.0, float(value))
+    except Exception:
+        return None
+
+
+def extract_timing(tokens):
+    speed_override = None
+    duration = None
+    cleaned = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        low = tok.lower()
+        if low in ("vel", "speed") and idx + 1 < len(tokens):
+            candidate = parse_speed(tokens[idx + 1])
+            if candidate is not None:
+                speed_override = candidate
+                idx += 2
+                continue
+        if low in ("ts", "t", "time", "tiempo", "seg", "segundos", "s") and idx + 1 < len(tokens):
+            candidate = parse_seconds(tokens[idx + 1])
+            if candidate is not None:
+                duration = candidate
+                idx += 2
+                continue
+        cleaned.append(tok)
+        idx += 1
+    return cleaned, speed_override, duration
+
+
+def set_motor_speed(value):
+    global motor_speed
+    parsed = parse_speed(value)
+    if parsed is None:
+        print("[warn] Velocidad invalida:", value)
+        return motor_speed
+    motor_speed = parsed
+    print("[info] Velocidad base ->", motor_speed)
+    return motor_speed
+
+
+def robot_move(direction, speed=None):
+    global last_move, motor_speed
+    if motor_speed is None:
+        motor_speed = parse_speed(MOTOR_DEFAULT_SPEED) or 35
+
+    cmd = str(direction).lower()
+    now = time.monotonic()
+    if speed is None:
+        speed_value = motor_speed
+    else:
+        parsed = parse_speed(speed)
+        if parsed is None:
+            print("[warn] Velocidad invalida, usando", motor_speed)
+            speed_value = motor_speed
+        else:
+            motor_speed = parsed
+            speed_value = parsed
+
+    print("[cmd] Movimiento ->", cmd, "@", speed_value)
+
+    stop_cmds = {"stop", "idle", "halt", "brake", "neutral"}
+    if not motor:
+        last_move.update({"direction": cmd, "speed": 0 if cmd in stop_cmds else speed_value, "when": now})
+        return
+    try:
+        if cmd in stop_cmds:
+            if hasattr(motor, "motor_stop"):
+                motor.motor_stop()
+            elif hasattr(motor, "stop"):
+                motor.stop()
+            elif hasattr(motor, "move"):
+                motor.move(0, "stop", 0)
+        elif hasattr(motor, "move"):
+            motor.move(1, cmd, speed_value)
+        elif hasattr(motor, cmd):
+            getattr(motor, cmd)()
+    except Exception as e:
+        print("[warn] Motor error:", e)
+    finally:
+        last_move.update({
+            "direction": "stop" if cmd in stop_cmds else cmd,
+            "speed": 0 if cmd in stop_cmds else speed_value,
+            "when": now,
+        })
+        update_matrix(last_move["direction"])
+
+
+def robot_servo(value):
+    global last_servo_pos
+    try:
+        angle = int(value)
+    except Exception:
+        print("[warn] Valor de servo invalido:", value)
+        return
+    last_servo_pos = angle
+    if not servo:
+        return
+    try:
+        if hasattr(servo, "set_angle"):
+            tgt_pin = servo_pin or getattr(servo, "pin", None)
+            if tgt_pin is not None:
+                servo.set_angle(tgt_pin, angle)
+            else:
+                servo.set_angle(angle)
+        elif hasattr(servo, "angle"):
+            servo.angle = angle
+        elif hasattr(servo, "move"):
+            servo.move(angle)
+    except Exception as e:
+        print("[warn] Servo error:", e)
+
+
+def record_command(title, detail=None):
+    global last_command
+    primary = "" if title is None else str(title)
+    secondary = "" if detail in (None, "") else str(detail)
+    last_command = (primary, secondary)
+
+
+MATRIX_PATTERNS = {
+    "forward": [
+        ".......##.......",
+        "......####......",
+        ".....######.....",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+    ],
+    "backward": [
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".......##.......",
+        ".....######.....",
+        "......####......",
+        ".......##.......",
+    ],
+    "left": [
+        "........#.......",
+        ".......##.......",
+        "......###.......",
+        ".....########...",
+        ".....########...",
+        "......###.......",
+        ".......##.......",
+        "........#.......",
+    ],
+    "right": [
+        ".......#........",
+        ".......##.......",
+        ".......###......",
+        "...########.....",
+        "...########.....",
+        ".......###......",
+        ".......##.......",
+        ".......#........",
+    ],
+    "left_forward": [
+        "..#.............",
+        ".######.........",
+        "########........",
+        "....###.........",
+        ".....###........",
+        "......###.......",
+        ".......###......",
+        ".........##.....",
+    ],
+    "right_forward": [
+        ".............#..",
+        "..........#####.",
+        "........########",
+        ".........###....",
+        "........###.....",
+        ".......###......",
+        "......###.......",
+        ".....##.........",
+    ],
+    "left_backward": [
+        ".....##.........",
+        "......###.......",
+        ".......###......",
+        "........###.....",
+        ".........###....",
+        "........########",
+        "...........####.",
+        "..............#.",
+    ],
+    "right_backward": [
+        ".........##.....",
+        ".......###......",
+        "......###.......",
+        ".....###........",
+        "....###.........",
+        "########.......",
+        ".####...........",
+        ".#..............",
+    ],
+    "turn_left": [
+        "#.....#.........",
+        ".....##.........",
+        "...###..........",
+        ".########.......",
+        ".########.......",
+        "...###..........",
+        ".....##.........",
+        "......#.........",
+    ],
+    "turn_right": [
+        ".........#.....#",
+        ".........##.....",
+        "..........###...",
+        ".......########.",
+        ".......########.",
+        "..........###...",
+        ".........##.....",
+        ".........#......",
+    ],
+    "stop": [
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+        "................",
+    ],
+}
+
+
+def update_matrix(direction):
+    if not matrix_display:
+        return
+
+    key = str(direction).lower() if direction is not None else "stop"
+    pattern = MATRIX_PATTERNS.get(key, MATRIX_PATTERNS["stop"])
+
+    try:
+        matrix_display.fill(0)
+        for row, row_data in enumerate(pattern):
+            for col, char in enumerate(row_data[:16]):
+                if char != ".":
+                    matrix_display.pixel(col, row, 1)
+        matrix_display.show()
+    except Exception as err:
+        print("[warn] LED matrix write error:", err)
+
+
+def lcd_show(content):
+    global last_lcd_text
+    if not lcd_display or not hasattr(lcd_display, "lcd"):
+        print("[warn] LCD no disponible")
+        return
+
+    try:
+        if isinstance(content, (list, tuple)):
+            lines = [str(part) for part in content]
+        else:
+            lines = str(content).splitlines() if content not in (None, "") else [""]
+
+        if not lines:
+            lines = [""]
+
+        formatted = []
+        for line in lines[:2]:
+            formatted.append(line[:16])
+        while len(formatted) < 2:
+            formatted.append("")
+
+        lcd_display.lcd.clear()
+        lcd_display.lcd.print(formatted[0])
+        lcd_display.lcd.print("\n")
+        lcd_display.lcd.print(formatted[1])
+
+        last_lcd_text = tuple(formatted)
+    except Exception as e:
+        print("[warn] LCD write error:", e)
+
+
+def show_command_on_lcd(title, detail=None):
+    record_command(title, detail)
+    header = "CMD: " + str(title) if title is not None else "CMD"
+    if detail in (None, ""):
+        lcd_show([header, ""])
+    else:
+        lcd_show([header, str(detail)])
+
+
+def gather_status(now_ts):
+    ip = str(getattr(wifi.radio, "ipv4_address", None)) if wifi else None
+
+    line_values = None
+    try:
+        if line_sensor and hasattr(line_sensor, "get_ir_value"):
+            raw = line_sensor.get_ir_value()
+            vals = [bool(v) for v in raw]
+            if LINE_SENSORS_INVERT:
+                vals = [not v for v in vals]
+            line_values = vals
+    except Exception:
+        line_values = None
+
+    distance_cm = None
+    try:
+        if ultrasonic:
+            distance_cm = ultrasonic.get_distance()
+    except Exception:
+        distance_cm = None
+
+    servo_pos = last_servo_pos
+    try:
+        if servo_pos is None and car_module is not None:
+            shared_servo = getattr(car_module, "servo", None)
+            if shared_servo is not None:
+                servo_pos = getattr(shared_servo, "last_angle", None)
+        if servo_pos is None and servo is not None:
+            servo_pos = getattr(servo, "last_angle", None)
+            if servo_pos is None and hasattr(servo, "angle"):
+                servo_pos = getattr(servo, "angle", None)
+    except Exception:
+        pass
+
+    motor_snapshot = {}
+    try:
+        if car_module is not None:
+            for name in ("Motor_LF", "Motor_RF", "Motor_RB", "Motor_LB"):
+                pwm = getattr(car_module, name + "_PWM", None)
+                direction_pin = getattr(car_module, name + "_Dir", None)
+                if pwm is None or direction_pin is None:
+                    continue
+                duty = getattr(pwm, "duty_cycle", None)
+                dir_val = getattr(direction_pin, "value", None)
+                try:
+                    if duty is None:
+                        pct = None
+                    elif dir_val is True:
+                        pct = int(((65535 - duty) / 65535.0) * 100)
+                    else:
+                        pct = int((duty / 65535.0) * 100)
+                except Exception:
+                    pct = None
+                direction = None
+                if dir_val is False:
+                    direction = "forward"
+                elif dir_val is True:
+                    direction = "backward"
+                motor_snapshot[name] = {"duty_pct": pct, "direction": direction}
+    except Exception:
+        motor_snapshot = {}
+    
+    enc_vals = None
+    if encoder_LF:
+        enc_vals = {
+            "LF": encoder_LF.count,
+            "RF": encoder_RF.count,
+            "LB": encoder_LB.count,
+            "RB": encoder_RB.count
+        }
+
+    status = {
+        "ts": int(now_ts),
+        "ip": ip,
+        "line": line_values,
+        "distance_cm": distance_cm,
+        "servo": servo_pos,
+        "motors": motor_snapshot if motor_snapshot else last_move,
+        "lcd": last_lcd_text,
+        "command": last_command,
+        "speed": motor_speed,
+        "encoders": enc_vals,
+    }
+    return status
+
+
+def update_status_snapshot(now_ts=None):
+    global last_status
+    if now_ts is None:
+        now_ts = time.monotonic()
+    status = gather_status(now_ts)
+    status["command"] = last_command
+    status["lcd"] = last_lcd_text
+    status["motors"] = status.get("motors") or last_move
+    status["servo"] = last_servo_pos
+    status["speed"] = motor_speed
+    last_status = status
+    update_dashboard_status(status)
+    return status
+
+
+def reset_motion_queue():
+    global command_queue, active_command, active_until, last_move_read_ts
+    command_queue = []
+    active_command = None
+    active_until = None
+    last_move_read_ts = None
+
+
+def enqueue_move(direction, speed, duration, lcd_detail=None):
+    command_queue.append({
+        "type": "move",
+        "direction": direction,
+        "speed": speed,
+        "duration": duration,
+        "lcd_detail": lcd_detail,
+    })
+
+
+def enqueue_pause(duration):
+    command_queue.append({"type": "pause", "duration": duration})
+
+
+def enqueue_stop():
+    command_queue.append({"type": "stop"})
+
+
+def enqueue_read(detail=None):
+    command_queue.append({"type": "read", "detail": detail})
+
+
+def process_command_queue(now_ts):
+    global active_command, active_until, last_move_read_ts
+
+    if active_command is not None and active_command.get("type") == "move":
+        if READ_DURING_MOVE_SECONDS > 0:
+            if last_move_read_ts is None or (now_ts - last_move_read_ts) >= READ_DURING_MOVE_SECONDS:
+                show_command_on_lcd("LECTURA", "MOV")
+                update_status_snapshot(now_ts)
+                if last_status is not None:
+                    print_status(last_status)
+                last_move_read_ts = now_ts
+
+    if active_command is not None and active_command.get("type") == "move" and command_queue:
+        next_cmd = command_queue[0]
+        if next_cmd.get("type") == "read":
+            command_queue.pop(0)
+            detail = next_cmd.get("detail") or "LECTURA"
+            show_command_on_lcd("LECTURA", detail)
+            update_status_snapshot(now_ts)
+
+    if active_command is None and command_queue:
+        active_command = command_queue.pop(0)
+        cmd_type = active_command.get("type")
+
+        if cmd_type == "move":
+            direction = active_command.get("direction")
+            speed = active_command.get("speed")
+            lcd_detail = active_command.get("lcd_detail") or direction
+            robot_move(direction, speed)
+            show_command_on_lcd("MOVE", lcd_detail)
+            update_status_snapshot(now_ts)
+            duration = active_command.get("duration")
+            if duration is not None and duration > 0:
+                active_until = now_ts + duration
+            else:
+                active_command = None
+                active_until = None
+        elif cmd_type == "pause":
+            duration = active_command.get("duration") or 0
+            active_until = now_ts + duration
+        elif cmd_type == "stop":
+            robot_move("stop")
+            update_status_snapshot(now_ts)
+            active_command = None
+            active_until = None
+        elif cmd_type == "servo":
+            angle = active_command.get("angle")
+            if angle is not None:
+                robot_servo(angle)
+                show_command_on_lcd("SERVO", angle)
+                update_status_snapshot(now_ts)
+            active_command = None
+            active_until = None
+        elif cmd_type == "read":
+            detail = active_command.get("detail") or "LECTURA"
+            show_command_on_lcd("LECTURA", detail)
+            update_status_snapshot(now_ts)
+            active_command = None
+            active_until = None
+
+    if active_command is not None and active_until is not None and now_ts >= active_until:
+        if active_command.get("type") == "move":
+            robot_move("stop")
+            update_status_snapshot(now_ts)
+            last_move_read_ts = None
+        active_command = None
+        active_until = None
+
+
+def format_status_lines(status):
+    lines = []
+    lines.append("+-- Robot Status --------------------------------")
+    lines.append(f"| IP           : {status.get('ip')}")
+    enc = status.get('encoders')
+    if enc is None:
+        lines.append("| Encoders     : n/d")
+    else:
+        lines.append(f"| Encoders     : LF={enc['LF']} RF={enc['RF']} LB={enc['LB']} RB={enc['RB']}")
+    # -----------------------------------------------------------
+    line_vals = status.get('line')
+    if line_vals is None:
+        lines.append("| Line sensors : n/d")
+    else:
+        lines.append("| Line sensors : L=%s M=%s R=%s" % tuple(str(int(v)) for v in line_vals))
+    dist = status.get('distance_cm')
+    if dist is None:
+        lines.append("| Ultrasonic   : n/d")
+    else:
+        lines.append("| Ultrasonic   : %.1f cm" % dist)
+    lines.append(f"| Servo angle  : {status.get('servo')}")
+    speed_val = status.get('speed')
+    lines.append(f"| Motor speed  : {speed_val if speed_val is not None else 'n/d'}")
+    lcd_lines = status.get('lcd')
+    if lcd_lines:
+        if isinstance(lcd_lines, (list, tuple)) and len(lcd_lines) >= 2:
+            lines.append(f"| LCD line1    : {lcd_lines[0]}")
+            lines.append(f"| LCD line2    : {lcd_lines[1]}")
+        else:
+            lines.append(f"| LCD text     : {lcd_lines}")
+    motors = status.get('motors')
+    if isinstance(motors, dict) and motors and 'direction' not in motors:
+        for key in sorted(motors.keys()):
+            entry = motors[key]
+            lines.append("| Motor %-4s  : %s @ %s%%" % (
+                key[-2:],
+                entry.get('direction'),
+                entry.get('duty_pct')
+            ))
+    else:
+        lines.append(f"| Motors (cmd) : {motors}")
+    command = status.get('command')
+    if command:
+        title, detail = command if isinstance(command, (list, tuple)) else (command, "")
+        title = title or ""
+        detail = detail or ""
+        lines.append(f"| Last command : {title} {detail}")
+    lines.append("+-------------------------------------------------")
+    return lines
+
+
+def print_status(status):
+    for line in format_status_lines(status):
+        print(line)
+
+
+def handle_command(raw):
+    global last_status, last_command, last_lcd_text, last_move, last_servo_pos, motor_speed, status_publish_enabled
+
+    def sync_status():
+        update_status_snapshot()
+
+    def maybe_reset_motion_queue(flag_state):
+        if not flag_state["reset"]:
+            reset_motion_queue()
+            flag_state["reset"] = True
+
+    def handle_dict(data, batch_state=None):
+        global status_publish_enabled
+        handled_fields = []
+        duration = None
+        for key in ("duration", "time", "ts"):
+            if key in data:
+                duration = parse_seconds(data.get(key))
+                break
+        if "action" in data:
+            if batch_state is not None:
+                maybe_reset_motion_queue(batch_state)
+            else:
+                reset_motion_queue()
+            enqueue_move(data["action"], data.get("speed"), duration, data["action"])
+            handled_fields.append("action")
+        if "servo" in data:
+            robot_servo(data["servo"])
+            show_command_on_lcd("SERVO", data["servo"])
+            handled_fields.append("servo")
+        if "lcd" in data:
+            record_command("LCD", data["lcd"])
+            lcd_show(data["lcd"])
+            handled_fields.append("lcd")
+        if "speed" in data and "action" not in data:
+            new_speed = set_motor_speed(data["speed"])
+            handled_fields.append(f"speed:{new_speed}")
+        if "status" in data:
+            flag_raw = str(data.get("status")).strip().lower()
+            enable_flag = flag_raw in ("1", "true", "on", "start", "enable", "enabled", "si")
+            status_publish_enabled = enable_flag
+            handled_fields.append(f"status:{'on' if enable_flag else 'off'}")
+        if handled_fields:
+            sync_status()
+            return True, "JSON -> " + ",".join(handled_fields)
+        return False, "JSON sin acciones"
+
+    def handle_single(msg, batch_state=None):
+        global status_publish_enabled
+        raw_tokens = msg.replace(":", " ").split()
+        primary = raw_tokens[0].lower() if raw_tokens else ""
+
+        if primary == "speed":
+            if len(raw_tokens) >= 2:
+                new_speed = set_motor_speed(raw_tokens[1])
+                sync_status()
+                return True, f"Velocidad {new_speed}"
+            return False, "Speed sin valor"
+
+        if primary == "status":
+            if len(raw_tokens) >= 2:
+                flag_raw = raw_tokens[1].strip().lower()
+                enable_flag = flag_raw in ("1", "true", "on", "start", "enable", "enabled", "si")
+                status_publish_enabled = enable_flag
+                sync_status()
+                return True, f"Status MQTT {'on' if enable_flag else 'off'}"
+            return False, "Status sin valor"
+
+        if primary in ("lectura", "read"):
+            if batch_state is not None:
+                enqueue_read("MANUAL")
+                return True, "Lectura en cola"
+            reset_motion_queue()
+            enqueue_read("MANUAL")
+            process_command_queue(time.monotonic())
+            return True, "Lectura capturada"
+
+        tokens, speed_override, duration = extract_timing(raw_tokens)
+        primary = tokens[0].lower() if tokens else ""
+        speed_token = tokens[1] if len(tokens) > 1 else None
+
+        if primary in (
+            "forward",
+            "backward",
+            "left",
+            "right",
+            "left_forward",
+            "right_forward",
+            "left_backward",
+            "right_backward",
+            "turn_left",
+            "turn_right",
+            "stop",
+            "idle",
+        ):
+            override_speed = speed_override if speed_override is not None else (
+                parse_speed(speed_token) if speed_token is not None else None
+            )
+            if batch_state is not None:
+                maybe_reset_motion_queue(batch_state)
+            else:
+                reset_motion_queue()
+            if primary in ("stop", "idle"):
+                enqueue_stop()
+            else:
+                enqueue_move(primary, override_speed, duration, msg)
+            process_command_queue(time.monotonic())
+            if override_speed is not None:
+                note = f"Movimiento: {primary} @{override_speed}"
+            else:
+                note = f"Movimiento: {primary}"
+            if duration is not None:
+                note += f" {duration}s"
+            return True, note
+
+        if primary in ("pause", "wait", "sleep"):
+            pause_value = parse_seconds(speed_token) if speed_token is not None else duration
+            if pause_value is None:
+                return False, "Pausa sin duracion"
+            if batch_state is not None:
+                enqueue_pause(pause_value)
+                return True, f"Pausa {pause_value}s"
+            reset_motion_queue()
+            enqueue_pause(pause_value)
+            process_command_queue(time.monotonic())
+            return True, f"Pausa {pause_value}s"
+
+        # Comandos directos de motor por rueda: motor <LF|RF|LB|RB> <forward|backward|stop> [speed]
+        if primary == "motor" and len(tokens) >= 3 and car_module is not None:
+            wheel_name = tokens[1].upper()  # LF, RF, LB, RB
+            action = tokens[2].lower()
+            speed_arg = tokens[3] if len(tokens) >= 4 else None
+
+            pwm_attr = f"Motor_{wheel_name}_PWM"
+            dir_attr = f"Motor_{wheel_name}_Dir"
+            pwm = getattr(car_module, pwm_attr, None)
+            direction_pin = getattr(car_module, dir_attr, None)
+
+            if pwm is None or direction_pin is None:
+                return False, f"Rueda {wheel_name} no disponible"
+
+            base_speed = parse_speed(speed_arg) if speed_arg is not None else (motor_speed or MOTOR_DEFAULT_SPEED)
+            if base_speed is None:
+                base_speed = MOTOR_DEFAULT_SPEED
+
+            wheel_methods = {
+                "LF": "motor_left_front",
+                "RF": "motor_right_front",
+                "LB": "motor_left_back",
+                "RB": "motor_right_back",
+            }
+            motor_method_name = wheel_methods.get(wheel_name)
+            motor_method = getattr(motor, motor_method_name, None) if motor is not None else None
+
+            try:
+                if action in ("stop", "idle", "halt", "brake"):
+                    if motor_method is not None:
+                        motor_method(0, car_module.Dir_forward, 0)
+                    else:
+                        pwm.duty_cycle = 0
+                else:
+                    if action == "forward":
+                        direction = car_module.Dir_forward
+                    elif action == "backward":
+                        direction = car_module.Dir_backward
+                    else:
+                        return False, "Accion de motor invalida"
+
+                    if motor_method is not None:
+                        motor_method(1, direction, base_speed)
+                    else:
+                        direction_pin.value = direction == car_module.Dir_backward
+                        value = int((max(0, min(100, base_speed)) / 100.0) * 65535)
+                        pwm.duty_cycle = 65535 - value if direction_pin.value else value
+            except Exception as e:
+                print("[warn] Motor rueda error:", e)
+                return False, "Error motor rueda"
+
+            # Actualizar snapshot simplificado en last_move y status
+            last_move.update({"direction": f"{wheel_name}:{action}", "speed": base_speed, "when": time.monotonic()})
+            sync_status()
+            return True, f"Motor {wheel_name} {action} @{base_speed}"
+
+        if primary == "servo":
+            if len(tokens) >= 2:
+                robot_servo(tokens[1])
+                show_command_on_lcd("SERVO", tokens[1])
+                sync_status()
+                return True, f"Servo -> {tokens[1]}"
+            return False, "Servo sin valor"
+
+        if primary == "lcd":
+            text = msg[len(tokens[0]):]
+            if text.startswith(":"):
+                text = text[1:]
+            text = text.lstrip()
+            record_command("LCD", text)
+            lcd_show(text)
+            sync_status()
+            return True, "LCD actualizado"
+
+        data = None
+        if ("{" in msg and "}" in msg) or ("[" in msg and "]" in msg):
+            try:
+                data = json.loads(msg)
+            except Exception as err:
+                print("[warn] JSON invalido:", err)
+
+        if isinstance(data, dict):
+            return handle_dict(data, batch_state)
+
+        show_command_on_lcd("UNKNOWN", msg[:16])
+        return False, "Comando desconocido"
+
+    if raw is None:
+        return False, "Comando vacio"
+
+    msg = str(raw).strip()
+    if not msg:
+        return False, "Comando vacio"
+
+    data = None
+    if msg[:1] in "[{":
+        try:
+            data = json.loads(msg)
+        except Exception as err:
+            print("[warn] JSON invalido:", err)
+
+    if isinstance(data, list):
+        any_handled = False
+        handled_count = 0
+        batch_state = {"reset": False}
+        for idx, item in enumerate(data):
+            if isinstance(item, dict):
+                handled, _note = handle_dict(item, batch_state)
+            else:
+                item_text = str(item).strip()
+                if not item_text:
+                    continue
+                handled, _note = handle_single(item_text, batch_state)
+            if handled:
+                any_handled = True
+                handled_count += 1
+            if idx < len(data) - 1 and SEQUENCE_PAUSE_SECONDS > 0:
+                enqueue_pause(SEQUENCE_PAUSE_SECONDS)
+        process_command_queue(time.monotonic())
+        return any_handled, f"Lote: {handled_count}"
+
+    if isinstance(data, dict):
+        return handle_dict(data)
+
+    if "\n" in msg or ";" in msg:
+        parts = [part.strip() for part in msg.replace(";", "\n").splitlines() if part.strip()]
+        any_handled = False
+        handled_count = 0
+        batch_state = {"reset": False}
+        for idx, part in enumerate(parts):
+            handled, _note = handle_single(part, batch_state)
+            if handled:
+                any_handled = True
+                handled_count += 1
+            if idx < len(parts) - 1 and SEQUENCE_PAUSE_SECONDS > 0:
+                enqueue_pause(SEQUENCE_PAUSE_SECONDS)
+        process_command_queue(time.monotonic())
+        return any_handled, f"Lote: {handled_count}"
+
+    return handle_single(msg)
+
+
+# --- MQTT callbacks -------------------------------------------------------
+
+def on_connect(client, userdata, flags, rc):
+    print("[🦕] MQTT conectado (rc=%s)" % rc)
+    try:
+        client.subscribe(TOPIC_SUB)
+        client.publish(TOPIC_PUB, json.dumps({"status": "online"}))
+    except Exception as e:
+        print("[warn] Subscribe/publish inicial fallo:", e)
+
+def on_message(client, topic, message):
+    msg = message.decode() if isinstance(message, (bytes, bytearray)) else str(message)
+    print("[info] MQTT RX", topic, "->", msg)
+    handled, note = handle_command(msg)
+    if handled:
+        print("[info] Accion MQTT:", note)
+    else:
+        print("[warn] Payload desconocido (MQTT)")
+
+# --- Integración con dashboard -------------------------------------------
+
+# --- Programa principal ---------------------------------------------------
+
+def main():
+    global last_status, motor_speed, publish_sequence
+
+    if motor_speed is None:
+        motor_speed = parse_speed(MOTOR_DEFAULT_SPEED) or 35
+
+    if not SSID or not PASSWORD:
+        print("[warn] settings.toml no tiene CIRCUITPY_WIFI_SSID / PASSWORD")
+        return
+    if not BROKER:
+        print("[warn] settings.toml no tiene MQTT_BROKER")
+        return
+
+    print("[🌐] Conectando WiFi...", SSID)
+    try:
+        wifi.radio.connect(SSID, PASSWORD)
+        print("[✅] WiFi OK, IP:", wifi.radio.ipv4_address)
+    except Exception as e:
+        print("[❌] Error WiFi:", e)
+        return
+
+    pool = socketpool.SocketPool(wifi.radio)
+
+    try:
+        client = MQTT(
+            broker=BROKER,
+            port=PORT,
+            client_id="robot-" + str(int(time.monotonic())),
+            socket_pool=pool,
+        )
+    except Exception as e:
+        print("[error] MQTT init fallo:", e)
+        return
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    print("[🔌] Conectando a broker %s:%d..." % (BROKER, PORT))
+    try:
+        client.connect()
+    except Exception as e:
+        print("[error] MQTT connect() fallo:", e)
+        return
+
+    initial_now = time.monotonic()
+    last_status = gather_status(initial_now)
+    last_status["ping"] = 0
+    last_status["ping_ms"] = 0
+    last_status["seq"] = 0
+    update_dashboard_status(last_status)
+
+    start_dashboard(
+        pool,
+        wifi.radio,
+        HTTP_PORT,
+        handle_command,
+        lambda: last_status,
+        format_status_lines,
+        HTTP_USER,
+        HTTP_PASSWORD,
+    )
+
+    last = initial_now
+    last_terminal_print = initial_now
+    counter = 0
+
+    while True:
+        try:
+            client.loop()
+        except Exception as e:
+            print("[warn] loop() error:", e)
+            break
+
+        poll_dashboard()
+
+        now = time.monotonic()
+        process_command_queue(now)
+        moving = active_command is not None or bool(command_queue)
+        refresh_interval = MOVING_STATUS_REFRESH_SECONDS if moving else STATUS_REFRESH_SECONDS
+        terminal_interval = MOVING_TERMINAL_STATUS_INTERVAL if moving else TERMINAL_STATUS_INTERVAL
+        elapsed = now - last
+        if elapsed >= refresh_interval:
+            counter += 1
+            status = gather_status(now)
+            ping_ms = int(elapsed * 1000)
+            status["ping_ms"] = ping_ms
+            status["ping"] = counter
+            status["seq"] = counter
+            last_status = status
+            update_dashboard_status(status)
+            if now - last_terminal_print >= terminal_interval:
+                print_status(status)
+                last_terminal_print = now
+            if status_publish_enabled:
+                try:
+                    client.publish(TOPIC_PUB, json.dumps(status))
+                except Exception as e:
+                    print("[warn] publish() fallo:", e)
+            last = now
+
+        time.sleep(0.02)
+
+if __name__ == "__main__":
+    main()
